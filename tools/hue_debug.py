@@ -358,6 +358,16 @@ def print_lights_summary(api: HueAPI, raw: bool = False):
         if state.get("ct") is not None:
             print(f"    Color Temp:   {state['ct']} mirek")
 
+        # Parse endpoint from unique ID (format: xx:xx:xx:xx:xx:xx:xx:xx-NN)
+        uid = light.get("uniqueid", "")
+        if "-" in uid:
+            ep_hex = uid.split("-")[-1]
+            try:
+                ep_num = int(ep_hex, 16)
+                print(f"    Endpoint:     {ep_num} (0x{ep_hex})")
+            except ValueError:
+                pass
+
         cap = light.get("capabilities", {})
         if cap and raw:
             print(f"    Capabilities: {json.dumps(cap, indent=6)}")
@@ -369,6 +379,64 @@ def print_lights_summary(api: HueAPI, raw: bool = False):
                 if k not in ("state", "capabilities", "name", "type",
                              "modelid", "manufacturername", "uniqueid", "swversion"):
                     print(f"      {k}: {json.dumps(v)}")
+
+
+def print_endpoint_analysis(api: HueAPI, device_eui64: Optional[str] = None):
+    """Analyze which endpoints the bridge has discovered for our device."""
+    lights = api.get_lights()
+    print()
+    print("=" * 60)
+    print("  ENDPOINT ANALYSIS (ZigbeeDMX devices)")
+    print("=" * 60)
+
+    # Group lights by IEEE address (from unique ID)
+    devices = {}  # ieee_addr -> [(light_id, endpoint, name)]
+    for lid, light in lights.items():
+        uid = light.get("uniqueid", "")
+        mfr = light.get("manufacturername", "")
+        if mfr != "ZigbeeDMX" and not (device_eui64 and
+            device_eui64.lower().replace(":", "") in uid.lower().replace(":", "").replace("-", "")):
+            continue
+
+        if "-" in uid:
+            parts = uid.rsplit("-", 1)
+            ieee_part = parts[0]
+            try:
+                ep_num = int(parts[1], 16)
+            except ValueError:
+                ep_num = -1
+            devices.setdefault(ieee_part, []).append((lid, ep_num, light.get("name", "?")))
+
+    if not devices:
+        print("  No ZigbeeDMX devices found on bridge.")
+        print("  Run: python3 tools/hue_debug.py --search")
+        return
+
+    for ieee, endpoints in devices.items():
+        print(f"\n  Device IEEE: {ieee}")
+        print(f"  Discovered endpoints ({len(endpoints)}):")
+        for lid, ep, name in sorted(endpoints, key=lambda x: x[1]):
+            print(f"    Endpoint {ep} (0x{ep:02x}) -> Light #{lid}: {name}")
+
+        # Check for missing endpoints (based on expected range 10-25)
+        discovered_eps = {ep for _, ep, _ in endpoints}
+        min_ep = min(discovered_eps)
+        max_ep = max(discovered_eps) if len(discovered_eps) > 1 else min_ep
+        if max_ep == min_ep:
+            print(f"\n  WARNING: Only 1 endpoint discovered (endpoint {min_ep}).")
+            print(f"  If you have multiple lights configured, the Hue Bridge may not")
+            print(f"  have discovered them all. This is a known Hue Bridge limitation.")
+            print(f"  The bridge typically only discovers the first endpoint on a device.")
+            print()
+            print(f"  Workarounds:")
+            print(f"    1. Try running --search again (sometimes repeated searches help)")
+            print(f"    2. Delete this light, re-pair, and run search multiple times")
+            print(f"    3. Use a coordinator that supports multi-endpoint devices:")
+            print(f"       - deCONZ/Phoscon (Hue API compatible)")
+            print(f"       - Zigbee2MQTT (with custom converter)")
+            print(f"       - ZHA (Home Assistant)")
+        else:
+            print(f"  All expected endpoints appear to be discovered.")
 
 
 def print_new_lights(api: HueAPI):
@@ -491,8 +559,18 @@ def cmd_overview(api: HueAPI, device_ip: Optional[str], raw: bool):
     print_lights_summary(api, raw=raw)
     print_new_lights(api)
     print_sensors_summary(api)
+
+    # Get device EUI64 for endpoint analysis
+    eui64 = None
     if device_ip:
+        try:
+            r = requests.get(f"http://{device_ip}/api/status", timeout=5)
+            eui64 = r.json().get("eui64")
+        except Exception:
+            pass
         print_device_status(device_ip)
+
+    print_endpoint_analysis(api, eui64)
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +597,8 @@ def main():
                         help="Show raw/full data for all lights")
     parser.add_argument("--delete-light",
                         help="Delete a light from the bridge by ID")
+    parser.add_argument("--endpoints", action="store_true",
+                        help="Analyze which endpoints the bridge discovered for our device")
 
     args = parser.parse_args()
 
@@ -549,6 +629,18 @@ def main():
 
     if args.search:
         cmd_search(api)
+        return
+
+    if args.endpoints:
+        # Get device EUI64 if possible
+        eui64 = None
+        if args.device_ip:
+            try:
+                r = requests.get(f"http://{args.device_ip}/api/status", timeout=5)
+                eui64 = r.json().get("eui64")
+            except Exception:
+                pass
+        print_endpoint_analysis(api, eui64)
         return
 
     if args.light_id:
