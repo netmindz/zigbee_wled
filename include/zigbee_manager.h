@@ -1,5 +1,5 @@
 /*
- * Zigbee DMX Bridge - Zigbee Manager
+ * Zigbee WLED Bridge - Zigbee Manager
  *
  * Manages the Zigbee stack running as End Device(s).
  * Creates one Zigbee HA Color Dimmable Light endpoint per configured light.

@@ -1,10 +1,11 @@
 /*
- * Zigbee DMX Bridge - Web UI & WiFi Manager
+ * Zigbee WLED Bridge - Web UI & WiFi Manager
  *
  * Handles:
  * - Initial WiFi configuration via captive portal (AP mode)
- * - Web-based configuration UI for defining lights
+ * - Web-based configuration UI for WLED light definitions
  * - REST API for light configuration CRUD
+ * - WLED device discovery via mDNS
  * - Status page showing Zigbee pairing state
  */
 

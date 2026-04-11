@@ -1,58 +1,53 @@
 /*
- * Zigbee DMX Bridge - Main Entry Point
+ * Zigbee WLED Bridge - Main Entry Point
  *
  * ESP32-C6 firmware that:
  * 1. Provides a captive portal for WiFi setup
- * 2. Hosts a web UI for configuring RGB/RGBW DMX lights
- * 3. Presents each light as a Zigbee HA Color Dimmable Light (Hue-compatible)
- * 4. Outputs light states via wired DMX512 or ArtNet (UDP), configurable via web UI
+ * 2. Hosts a web UI for configuring WLED devices as Zigbee lights
+ * 3. Presents each WLED device as a Zigbee HA Extended Color Light (Hue-compatible)
+ * 4. Sends color/brightness commands to WLED devices via their JSON API
  *
  * Architecture:
- *   Hue Bridge  --(Zigbee ZCL)--> ESP32-C6 --(DMX512 / ArtNet)--> RGB/RGBW fixtures
+ *   Hue Bridge  --(Zigbee ZCL)--> ESP32-C6 --(HTTP JSON API)--> WLED devices
  *       |                             |
  *   Controls color/brightness    Web config UI
- *   via CIE XY color space       for light setup
+ *   via CIE XY color space       for WLED device setup
  */
 
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 #include "config_store.h"
-#include "dmx_output.h"
+#include "wled_output.h"
 #include "web_ui.h"
 #include "zigbee_manager.h"
 
-// DMX update rates
-// Wired DMX: 40Hz — DMX512 receivers expect continuous refresh
-// ArtNet: 2Hz — WiFi/Zigbee coexistence makes high rates unreliable
-static const unsigned long DMX_UPDATE_INTERVAL_WIRED_MS = 25;   // ~40 Hz
-static const unsigned long DMX_UPDATE_INTERVAL_ARTNET_MS = 500;  // 2 Hz
-static unsigned long lastDmxUpdate = 0;
+// WLED update rate: 2Hz — WiFi/Zigbee coexistence makes high rates unreliable,
+// and we only send on state change anyway (rate is a fallback ceiling)
+static const unsigned long WLED_UPDATE_INTERVAL_MS = 500;  // 2 Hz
+static unsigned long lastWledUpdate = 0;
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  ESP_LOGI("Main", "=== Zigbee DMX Bridge ===");
+  ESP_LOGI("Main", "=== Zigbee WLED Bridge ===");
   ESP_LOGI("Main", "Firmware v0.1.0");
 
   // 1. Load configuration from NVS
   configStore.begin();
   ESP_LOGI("Main", "Loaded %d light(s) from config", configStore.getLightCount());
-  ESP_LOGI("Main", "Output mode: %s",
-           configStore.getOutputConfig().mode == OUTPUT_MODE_ARTNET ? "ArtNet" : "Wired DMX");
 
   // 2. Init Zigbee platform (must be before WiFi starts)
   zigbeeSetup();
 
   // 3. Start WiFi + Web UI (this also triggers zigbeeStart() on WiFi connect)
-  //    DMX output is initialized after WiFi for ArtNet mode.
   webSetup();
 
   // 3b. Setup ArduinoOTA for network-based firmware upload from PlatformIO
-  ArduinoOTA.setHostname("zigbeedmx");
+  ArduinoOTA.setHostname("zigbeewled");
   ArduinoOTA.onStart([]() {
     ESP_LOGI("OTA", "OTA update starting...");
-    dmxOutput.stop();  // Stop DMX output during OTA
+    wledOutput.stop();  // Stop WLED output during OTA
   });
   ArduinoOTA.onEnd([]() {
     ESP_LOGI("OTA", "OTA update complete, rebooting...");
@@ -62,10 +57,8 @@ void setup() {
   });
   ArduinoOTA.begin();
 
-  // 4. Init DMX output
-  //    For wired DMX this starts immediately.
-  //    For ArtNet, it will lazy-init the UDP socket when WiFi is available.
-  dmxOutput.begin();
+  // 4. Init WLED output
+  wledOutput.begin();
 }
 
 // Interpolate a single channel value for smooth transitions
@@ -80,13 +73,10 @@ void loop() {
   // Handle OTA updates
   ArduinoOTA.handle();
 
-  // Update DMX output at fixed rate (rate depends on output mode)
+  // Update WLED devices at fixed rate (~2Hz)
   unsigned long now = millis();
-  unsigned long interval = (dmxOutput.getMode() == OUTPUT_MODE_ARTNET)
-                             ? DMX_UPDATE_INTERVAL_ARTNET_MS
-                             : DMX_UPDATE_INTERVAL_WIRED_MS;
-  if (now - lastDmxUpdate >= interval) {
-    lastDmxUpdate = now;
+  if (now - lastWledUpdate >= WLED_UPDATE_INTERVAL_MS) {
+    lastWledUpdate = now;
 
     uint8_t count = configStore.getLightCount();
     if (count > 0) {
@@ -116,8 +106,8 @@ void loop() {
         }
       }
 
-      // Update DMX output
-      dmxOutput.update(&configStore.getLight(0), states, count);
+      // Update WLED devices
+      wledOutput.update(&configStore.getLight(0), states, count);
     }
   }
 }

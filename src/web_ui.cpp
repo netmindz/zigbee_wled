@@ -1,10 +1,11 @@
 /*
- * Zigbee DMX Bridge - Web UI & WiFi Manager Implementation
+ * Zigbee WLED Bridge - Web UI & WiFi Manager Implementation
  *
  * Provides:
  * - Captive portal AP for initial WiFi setup
- * - Configuration web UI for light definitions
+ * - Configuration web UI for light definitions with WLED device discovery
  * - REST API: GET/POST /api/config, POST /api/factory-reset
+ * - WLED discovery API: GET /api/wled/discover
  * - Status API: GET /api/status
  *
  * Uses the built-in synchronous WebServer (not ESPAsyncWebServer)
@@ -13,7 +14,8 @@
 
 #include "web_ui.h"
 #include "config_store.h"
-#include "dmx_output.h"
+#include "wled_output.h"
+#include "wled_discovery.h"
 #include "zigbee_manager.h"
 
 #include <WiFi.h>
@@ -39,7 +41,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Zigbee DMX Bridge</title>
+<title>Zigbee WLED Bridge</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231a1a2e'/%3E%3Cpath d='M18 4L8 18h6l-2 10 10-14h-6z' fill='%2300d4ff'/%3E%3C/svg%3E">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -64,17 +66,18 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .btn-primary { background: #00d4ff; color: #1a1a2e; }
   .btn-danger { background: #e74c3c; }
   .btn-sm { padding: 4px 10px; font-size: 0.8em; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   input, select { background: #1a1a2e; color: #e0e0e0; border: 1px solid #0f3460;
                   border-radius: 4px; padding: 6px 10px; font-size: 0.9em; width: 100%; }
   label { font-size: 0.85em; color: #aaa; display: block; margin-bottom: 4px; }
   .form-group { margin-bottom: 10px; }
   .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .form-row-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; }
   .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
            background: rgba(0,0,0,0.7); z-index: 100; justify-content: center; align-items: center; }
   .modal.active { display: flex; }
   .modal-content { background: #16213e; border-radius: 8px; padding: 24px;
-                   max-width: 500px; width: 90%; border: 1px solid #0f3460; }
+                   max-width: 500px; width: 90%; border: 1px solid #0f3460;
+                   max-height: 90vh; overflow-y: auto; }
   .modal-title { font-size: 1.1em; margin-bottom: 16px; color: #00d4ff; }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
   .wifi-form { margin-top: 16px; }
@@ -86,11 +89,21 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .tag-rgb { background: #2d1f6e; color: #a78bfa; }
   .tag-rgbw { background: #1f4e6e; color: #7bc8fa; }
   .hidden { display: none; }
+  .wled-device { background: #0f3460; border-radius: 6px; padding: 12px; margin: 8px 0;
+                 cursor: pointer; border: 2px solid transparent; transition: border-color 0.2s; }
+  .wled-device:hover { border-color: #00d4ff; }
+  .wled-device.selected { border-color: #00d4ff; background: #1a3a6e; }
+  .wled-device .dev-name { font-weight: bold; color: #e0e0e0; }
+  .wled-device .dev-detail { font-size: 0.85em; color: #888; margin-top: 4px; }
+  .discover-status { text-align: center; padding: 12px; color: #888; font-size: 0.9em; }
+  .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #888;
+             border-top-color: #00d4ff; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
-<h1>Zigbee DMX Bridge</h1>
-<h2>ESP32-C6 Zigbee-to-DMX Light Controller</h2>
+<h1>Zigbee WLED Bridge</h1>
+<h2>ESP32-C6 Zigbee-to-WLED Light Controller</h2>
 
 <div class="status" id="statusBar">
   <div class="status-item">
@@ -134,41 +147,6 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
 </div>
 
-<!-- Output Settings -->
-<div class="card">
-  <h3 style="color:#00d4ff;margin-bottom:12px">Output Settings</h3>
-  <div class="form-group">
-    <label>Output Mode</label>
-    <select id="outputMode" onchange="toggleOutputFields()">
-      <option value="dmx">Wired DMX (RS-485)</option>
-      <option value="artnet">ArtNet (UDP)</option>
-    </select>
-  </div>
-  <div id="dmxFields">
-    <div class="form-row">
-      <div class="form-group">
-        <label>TX Pin (GPIO)</label>
-        <input type="number" id="dmxTxPin" min="-1" max="48" value="2">
-      </div>
-      <div class="form-group">
-        <label>Enable Pin (GPIO, -1=none)</label>
-        <input type="number" id="dmxEnPin" min="-1" max="48" value="4">
-      </div>
-    </div>
-  </div>
-  <div id="artnetFields" style="display:none">
-    <div class="form-group">
-      <label>ArtNet Universe</label>
-      <input type="number" id="artnetUniverse" min="0" max="32767" value="0">
-    </div>
-    <div class="form-group">
-      <label>Target IP <span style="color:#888;font-size:0.85em">(blank = broadcast)</span></label>
-      <input type="text" id="artnetTargetIp" placeholder="e.g. 192.168.1.100" value="">
-    </div>
-  </div>
-  <button class="btn btn-primary btn-sm" onclick="saveOutput()" style="margin-top:8px">Save Output Settings</button>
-</div>
-
 <!-- Actions -->
 <div class="actions">
   <button class="btn btn-sm" style="background:#0f3460" onclick="restartDevice()">Restart Device</button>
@@ -200,42 +178,37 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <input type="hidden" id="editIndex" value="-1">
     <div class="form-group">
       <label>Name</label>
-      <input type="text" id="lightName" placeholder="e.g. Stage Left Wash">
+      <input type="text" id="lightName" placeholder="e.g. Living Room Strip">
     </div>
     <div class="form-row">
       <div class="form-group">
         <label>Type</label>
-        <select id="lightType" onchange="toggleWhiteChannel()">
-          <option value="RGB">RGB (3 channels)</option>
-          <option value="RGBW">RGBW (4 channels)</option>
+        <select id="lightType">
+          <option value="RGB">RGB</option>
+          <option value="RGBW">RGBW</option>
         </select>
       </div>
       <div class="form-group">
-        <label>DMX Start Address</label>
-        <input type="number" id="dmxAddr" min="1" max="512" value="1">
+        <label>WLED Port</label>
+        <input type="number" id="wledPort" min="1" max="65535" value="80">
       </div>
     </div>
     <div class="form-group">
-      <label>Channel Mapping (offset from start address, 0-based)</label>
-      <div class="form-row-4">
-        <div>
-          <label>Red</label>
-          <input type="number" id="mapR" min="0" max="511" value="0">
-        </div>
-        <div>
-          <label>Green</label>
-          <input type="number" id="mapG" min="0" max="511" value="1">
-        </div>
-        <div>
-          <label>Blue</label>
-          <input type="number" id="mapB" min="0" max="511" value="2">
-        </div>
-        <div id="whiteField">
-          <label>White</label>
-          <input type="number" id="mapW" min="0" max="511" value="3">
-        </div>
+      <label>WLED Device IP / Hostname</label>
+      <input type="text" id="wledHost" placeholder="e.g. 192.168.1.50 or wled-abcdef.local">
+    </div>
+
+    <!-- WLED Discovery section -->
+    <div style="margin-top:12px;padding-top:12px;border-top:1px solid #0f3460">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <label style="margin:0">Or discover WLED devices on network:</label>
+        <button class="btn btn-sm" style="background:#0f3460" onclick="discoverWled()" id="discoverBtn">Scan</button>
+      </div>
+      <div id="discoveryResults">
+        <div class="discover-status" id="discoveryStatus">Click "Scan" to find WLED devices</div>
       </div>
     </div>
+
     <div class="modal-actions">
       <button class="btn" style="background:#444" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" onclick="saveLight()">Save</button>
@@ -244,7 +217,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </div>
 
 <script>
-let config = { lights: [], output: { mode: 'dmx', txPin: 2, enPin: 4, artnetUniverse: 0, artnetTargetIp: '' } };
+let config = { lights: [] };
 let isApMode = false;
 
 async function loadStatus() {
@@ -266,9 +239,7 @@ async function loadConfig() {
   try {
     const r = await fetch('/api/config');
     config = await r.json();
-    if (!config.output) config.output = { mode: 'dmx', txPin: 2, enPin: 4, artnetUniverse: 0, artnetTargetIp: '' };
     renderLights();
-    renderOutput();
   } catch(e) {
     console.error('Failed to load config:', e);
   }
@@ -284,7 +255,6 @@ async function loadLightStates() {
       if (!el) continue;
       const l = lights[i];
       if (l.on) {
-        // For RGBW lights, add white back into RGB for preview (screen can't show separate W)
         const pw = l.w || 0;
         const pr = Math.min(255, l.r + pw);
         const pg = Math.min(255, l.g + pw);
@@ -310,13 +280,11 @@ function renderLights() {
 
   list.innerHTML = config.lights.map((l, i) => {
     const tagClass = l.type === 'RGBW' ? 'tag-rgbw' : 'tag-rgb';
-    const mapStr = `R:${l.channelMap.r} G:${l.channelMap.g} B:${l.channelMap.b}` +
-      (l.type === 'RGBW' ? ` W:${l.channelMap.w}` : '');
     return `<div class="card light">
       <div class="light-preview" id="preview-${i}"></div>
       <div class="light-info">
         <div class="light-name">${escHtml(l.name)} <span class="tag ${tagClass}">${l.type}</span></div>
-        <div class="light-detail">DMX ${l.dmxAddr} | Map: ${mapStr} | Endpoint ${10 + i}</div>
+        <div class="light-detail">WLED: ${escHtml(l.wledHost || '(not set)')}:${l.wledPort || 80} | Endpoint ${10 + i}</div>
       </div>
       <div>
         <button class="btn btn-sm" style="background:#0f3460" onclick="editLight(${i})">Edit</button>
@@ -337,18 +305,9 @@ function showAddLight() {
   document.getElementById('editIndex').value = -1;
   document.getElementById('lightName').value = 'Light ' + (config.lights.length + 1);
   document.getElementById('lightType').value = 'RGB';
-  // Auto-calculate next DMX address
-  let nextAddr = 1;
-  if (config.lights.length > 0) {
-    const last = config.lights[config.lights.length - 1];
-    nextAddr = last.dmxAddr + (last.type === 'RGBW' ? 4 : 3);
-  }
-  document.getElementById('dmxAddr').value = nextAddr;
-  document.getElementById('mapR').value = 0;
-  document.getElementById('mapG').value = 1;
-  document.getElementById('mapB').value = 2;
-  document.getElementById('mapW').value = 3;
-  toggleWhiteChannel();
+  document.getElementById('wledHost').value = '';
+  document.getElementById('wledPort').value = 80;
+  clearDiscovery();
   document.getElementById('lightModal').classList.add('active');
 }
 
@@ -358,12 +317,9 @@ function editLight(i) {
   document.getElementById('editIndex').value = i;
   document.getElementById('lightName').value = l.name;
   document.getElementById('lightType').value = l.type;
-  document.getElementById('dmxAddr').value = l.dmxAddr;
-  document.getElementById('mapR').value = l.channelMap.r;
-  document.getElementById('mapG').value = l.channelMap.g;
-  document.getElementById('mapB').value = l.channelMap.b;
-  document.getElementById('mapW').value = l.channelMap.w || 3;
-  toggleWhiteChannel();
+  document.getElementById('wledHost').value = l.wledHost || '';
+  document.getElementById('wledPort').value = l.wledPort || 80;
+  clearDiscovery();
   document.getElementById('lightModal').classList.add('active');
 }
 
@@ -371,9 +327,60 @@ function closeModal() {
   document.getElementById('lightModal').classList.remove('active');
 }
 
-function toggleWhiteChannel() {
-  const isRGBW = document.getElementById('lightType').value === 'RGBW';
-  document.getElementById('whiteField').style.display = isRGBW ? 'block' : 'none';
+function clearDiscovery() {
+  document.getElementById('discoveryResults').innerHTML =
+    '<div class="discover-status" id="discoveryStatus">Click "Scan" to find WLED devices</div>';
+}
+
+async function discoverWled() {
+  const btn = document.getElementById('discoverBtn');
+  const results = document.getElementById('discoveryResults');
+  btn.disabled = true;
+  btn.textContent = 'Scanning...';
+  results.innerHTML = '<div class="discover-status"><span class="spinner"></span> Scanning network for WLED devices...</div>';
+
+  try {
+    const r = await fetch('/api/wled/discover');
+    const data = await r.json();
+    const devices = data.devices || [];
+
+    if (devices.length === 0) {
+      results.innerHTML = '<div class="discover-status">No WLED devices found. Make sure they are on the same network.</div>';
+    } else {
+      results.innerHTML = devices.map((d, i) =>
+        `<div class="wled-device" onclick="selectWledDevice(this, '${escAttr(d.host)}', ${d.port}, '${escAttr(d.name)}', ${d.isRGBW ? 'true' : 'false'})">
+          <div class="dev-name">${escHtml(d.name)}</div>
+          <div class="dev-detail">${escHtml(d.host)}:${d.port} | ${d.ledCount} LEDs | ${d.isRGBW ? 'RGBW' : 'RGB'} | v${escHtml(d.version)}</div>
+        </div>`
+      ).join('');
+    }
+  } catch(e) {
+    results.innerHTML = '<div class="discover-status" style="color:#e74c3c">Discovery failed: ' + escHtml(e.message) + '</div>';
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Scan';
+}
+
+function escAttr(s) {
+  return s.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+}
+
+function selectWledDevice(el, host, port, name, isRGBW) {
+  // Deselect all
+  document.querySelectorAll('.wled-device').forEach(d => d.classList.remove('selected'));
+  el.classList.add('selected');
+
+  // Fill in form fields
+  document.getElementById('wledHost').value = host;
+  document.getElementById('wledPort').value = port;
+  document.getElementById('lightType').value = isRGBW ? 'RGBW' : 'RGB';
+
+  // Use WLED device name if the light name is still the default
+  const nameField = document.getElementById('lightName');
+  if (nameField.value.match(/^Light \d+$/)) {
+    nameField.value = name;
+  }
 }
 
 async function saveLight() {
@@ -381,14 +388,14 @@ async function saveLight() {
   const light = {
     name: document.getElementById('lightName').value || 'Light',
     type: document.getElementById('lightType').value,
-    dmxAddr: parseInt(document.getElementById('dmxAddr').value) || 1,
-    channelMap: {
-      r: parseInt(document.getElementById('mapR').value) || 0,
-      g: parseInt(document.getElementById('mapG').value) || 0,
-      b: parseInt(document.getElementById('mapB').value) || 0,
-      w: parseInt(document.getElementById('mapW').value) || 0,
-    }
+    wledHost: document.getElementById('wledHost').value.trim(),
+    wledPort: parseInt(document.getElementById('wledPort').value) || 80,
   };
+
+  if (!light.wledHost) {
+    alert('Please enter a WLED device IP or hostname, or use discovery to find one.');
+    return;
+  }
 
   if (idx >= 0) {
     config.lights[idx] = light;
@@ -406,34 +413,6 @@ async function deleteLight(i) {
   config.lights.splice(i, 1);
   await postConfig();
   renderLights();
-}
-
-function renderOutput() {
-  const o = config.output || {};
-  document.getElementById('outputMode').value = o.mode || 'dmx';
-  document.getElementById('dmxTxPin').value = o.txPin != null ? o.txPin : 2;
-  document.getElementById('dmxEnPin').value = o.enPin != null ? o.enPin : 4;
-  document.getElementById('artnetUniverse').value = o.artnetUniverse || 0;
-  document.getElementById('artnetTargetIp').value = o.artnetTargetIp || '';
-  toggleOutputFields();
-}
-
-function toggleOutputFields() {
-  const mode = document.getElementById('outputMode').value;
-  document.getElementById('dmxFields').style.display = (mode === 'dmx') ? 'block' : 'none';
-  document.getElementById('artnetFields').style.display = (mode === 'artnet') ? 'block' : 'none';
-}
-
-async function saveOutput() {
-  config.output = {
-    mode: document.getElementById('outputMode').value,
-    txPin: parseInt(document.getElementById('dmxTxPin').value) || 2,
-    enPin: parseInt(document.getElementById('dmxEnPin').value),
-    artnetUniverse: parseInt(document.getElementById('artnetUniverse').value) || 0,
-    artnetTargetIp: document.getElementById('artnetTargetIp').value.trim(),
-  };
-  await postConfig();
-  alert('Output settings saved. Use "Restart Device" to apply changes.');
 }
 
 async function postConfig() {
@@ -552,7 +531,7 @@ Promise.all([loadStatus(), loadConfig()]).then(() => {
 // ---- Helper: load WiFi creds from NVS ----
 static void loadWifiCreds() {
   Preferences p;
-  if (!p.begin("zbdmx_wifi", false)) {
+  if (!p.begin("zbwled_wifi", false)) {
     ESP_LOGW("Web", "WiFi NVS namespace init failed");
     return;
   }
@@ -563,7 +542,7 @@ static void loadWifiCreds() {
 
 static void saveWifiCreds(const String& ssid, const String& pass) {
   Preferences p;
-  p.begin("zbdmx_wifi", false);
+  p.begin("zbwled_wifi", false);
   p.putString("ssid", ssid);
   p.putString("pass", pass);
   p.end();
@@ -586,8 +565,6 @@ static void setupRoutes() {
                    : "Searching...";
     doc["eui64"] = zigbeeGetEUI64();
     doc["lightCount"] = configStore.getLightCount();
-    const OutputConfig& oc = configStore.getOutputConfig();
-    doc["outputMode"] = (oc.mode == OUTPUT_MODE_ARTNET) ? "artnet" : "dmx";
 
     String json;
     serializeJson(doc, json);
@@ -604,13 +581,35 @@ static void setupRoutes() {
       JsonObject obj = arr.add<JsonObject>();
       obj["on"] = st.powerOn;
       obj["bri"] = st.brightness;
-      // Compute the effective DMX RGB (after brightness scaling)
       float briScale = st.powerOn ? (static_cast<float>(st.brightness) / 254.0f) : 0.0f;
       obj["r"] = static_cast<uint8_t>(st.red * briScale);
       obj["g"] = static_cast<uint8_t>(st.green * briScale);
       obj["b"] = static_cast<uint8_t>(st.blue * briScale);
       obj["w"] = static_cast<uint8_t>(st.white * briScale);
     }
+    String json;
+    serializeJson(doc, json);
+    server.send(200, "application/json", json);
+  });
+
+  // WLED device discovery API
+  server.on("/api/wled/discover", HTTP_GET, []() {
+    std::vector<WledDeviceInfo> devices;
+    wledDiscover(devices);
+
+    JsonDocument doc;
+    JsonArray arr = doc["devices"].to<JsonArray>();
+    for (const auto& dev : devices) {
+      JsonObject obj = arr.add<JsonObject>();
+      obj["name"] = dev.name;
+      obj["host"] = dev.host;
+      obj["port"] = dev.port;
+      obj["mac"] = dev.mac;
+      obj["ledCount"] = dev.ledCount;
+      obj["isRGBW"] = dev.isRGBW;
+      obj["version"] = dev.version;
+    }
+
     String json;
     serializeJson(doc, json);
     server.send(200, "application/json", json);
@@ -653,8 +652,6 @@ static void setupRoutes() {
       ESP_LOGI("Web", "Config saved: %d lights", configStore.getLightCount());
       // Signal Zigbee to reconfigure endpoints
       zigbeeReconfigure();
-      // Reconfigure DMX output (mode/pins may have changed)
-      dmxOutput.reconfigure();
       server.send(200, "application/json", "{\"ok\":true}");
     } else {
       ESP_LOGE("Web", "fromJson failed - doc contents:");
@@ -703,7 +700,7 @@ static void setupRoutes() {
 
     // Also clear WiFi credentials
     Preferences p;
-    p.begin("zbdmx_wifi", false);
+    p.begin("zbwled_wifi", false);
     p.clear();
     p.end();
 
@@ -738,8 +735,7 @@ static void setupRoutes() {
 
       if (upload.status == UPLOAD_FILE_START) {
         ESP_LOGI("OTA", "OTA upload start: %s (%u bytes)", upload.filename.c_str(), upload.totalSize);
-        // Stop DMX during OTA to free resources
-        dmxOutput.stop();
+        wledOutput.stop();
 
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
           ESP_LOGE("OTA", "Update.begin failed: %s", Update.errorString());
@@ -781,7 +777,7 @@ void webSetup() {
     WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
 
     // Also start a temporary AP for fallback access
-    WiFi.softAP("ZigbeeDMX-Setup", "");
+    WiFi.softAP("ZigbeeWLED-Setup", "");
     apMode = true;
 
     // Wait for connection (non-blocking, with timeout)
@@ -803,7 +799,7 @@ void webSetup() {
     // No WiFi configured - start AP mode only
     ESP_LOGI("Web", "No WiFi configured, starting AP mode");
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("ZigbeeDMX-Setup", "");
+    WiFi.softAP("ZigbeeWLED-Setup", "");
     apMode = true;
   }
 

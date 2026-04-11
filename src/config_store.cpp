@@ -1,5 +1,5 @@
 /*
- * Zigbee DMX Bridge - Configuration Storage Implementation
+ * Zigbee WLED Bridge - Configuration Storage Implementation
  */
 
 #include "config_store.h"
@@ -10,7 +10,7 @@ void ConfigStore::begin() {
   load();
 }
 
-int ConfigStore::addLight(const char* name, LightType type, uint16_t dmxAddr) {
+int ConfigStore::addLight(const char* name, LightType type, const char* wledHost, uint16_t wledPort) {
   if (lightCount >= MAX_LIGHTS) return -1;
 
   uint8_t idx = lightCount;
@@ -18,13 +18,8 @@ int ConfigStore::addLight(const char* name, LightType type, uint16_t dmxAddr) {
   cfg.active = true;
   strlcpy(cfg.name, name, sizeof(cfg.name));
   cfg.type = type;
-  cfg.dmxStartAddr = dmxAddr;
-
-  // Default channel mapping: R=0, G=1, B=2, W=3
-  cfg.channelMap.red   = 0;
-  cfg.channelMap.green = 1;
-  cfg.channelMap.blue  = 2;
-  cfg.channelMap.white = 3;
+  strlcpy(cfg.wledHost, wledHost, sizeof(cfg.wledHost));
+  cfg.wledPort = wledPort;
 
   lightCount++;
   return idx;
@@ -50,16 +45,9 @@ bool ConfigStore::updateLight(uint8_t index, const LightConfig& cfg) {
 }
 
 void ConfigStore::save() {
-  prefs.begin("zbdmx", false);
+  prefs.begin("zbwled", false);
 
   prefs.putUChar("lightCount", lightCount);
-
-  // Save output config
-  prefs.putUChar("outMode", static_cast<uint8_t>(outputCfg.mode));
-  prefs.putChar("outTxPin", outputCfg.txPin);
-  prefs.putChar("outEnPin", outputCfg.enPin);
-  prefs.putUShort("outArtUni", outputCfg.artnetUniverse);
-  prefs.putString("outArtTgtIp", outputCfg.artnetTargetIp);
 
   for (uint8_t i = 0; i < lightCount; i++) {
     char key[16];
@@ -70,29 +58,20 @@ void ConfigStore::save() {
     snprintf(key, sizeof(key), "l%d_type", i);
     prefs.putUChar(key, static_cast<uint8_t>(lights[i].type));
 
-    snprintf(key, sizeof(key), "l%d_addr", i);
-    prefs.putUShort(key, lights[i].dmxStartAddr);
+    snprintf(key, sizeof(key), "l%d_host", i);
+    prefs.putString(key, lights[i].wledHost);
 
-    snprintf(key, sizeof(key), "l%d_mapR", i);
-    prefs.putUChar(key, lights[i].channelMap.red);
-
-    snprintf(key, sizeof(key), "l%d_mapG", i);
-    prefs.putUChar(key, lights[i].channelMap.green);
-
-    snprintf(key, sizeof(key), "l%d_mapB", i);
-    prefs.putUChar(key, lights[i].channelMap.blue);
-
-    snprintf(key, sizeof(key), "l%d_mapW", i);
-    prefs.putUChar(key, lights[i].channelMap.white);
+    snprintf(key, sizeof(key), "l%d_port", i);
+    prefs.putUShort(key, lights[i].wledPort);
   }
 
   prefs.end();
-  ESP_LOGI("Config", "Saved %d lights, output mode=%d to NVS", lightCount, outputCfg.mode);
+  ESP_LOGI("Config", "Saved %d lights to NVS", lightCount);
 }
 
 void ConfigStore::load() {
   // Open in read-write mode to ensure namespace is created on first boot
-  if (!prefs.begin("zbdmx", false)) {
+  if (!prefs.begin("zbwled", false)) {
     ESP_LOGW("Config", "NVS namespace init failed, starting with empty config");
     lightCount = 0;
     return;
@@ -100,14 +79,6 @@ void ConfigStore::load() {
 
   lightCount = prefs.getUChar("lightCount", 0);
   if (lightCount > MAX_LIGHTS) lightCount = MAX_LIGHTS;
-
-  // Load output config
-  outputCfg.mode = static_cast<OutputMode>(prefs.getUChar("outMode", OUTPUT_MODE_WIRED_DMX));
-  outputCfg.txPin = prefs.getChar("outTxPin", 2);
-  outputCfg.enPin = prefs.getChar("outEnPin", 4);
-  outputCfg.artnetUniverse = prefs.getUShort("outArtUni", 0);
-  String targetIp = prefs.getString("outArtTgtIp", "");
-  strlcpy(outputCfg.artnetTargetIp, targetIp.c_str(), sizeof(outputCfg.artnetTargetIp));
 
   for (uint8_t i = 0; i < lightCount; i++) {
     char key[16];
@@ -119,54 +90,29 @@ void ConfigStore::load() {
     snprintf(key, sizeof(key), "l%d_type", i);
     lights[i].type = static_cast<LightType>(prefs.getUChar(key, LIGHT_TYPE_RGB));
 
-    snprintf(key, sizeof(key), "l%d_addr", i);
-    lights[i].dmxStartAddr = prefs.getUShort(key, 1);
+    snprintf(key, sizeof(key), "l%d_host", i);
+    String host = prefs.getString(key, "");
+    strlcpy(lights[i].wledHost, host.c_str(), sizeof(lights[i].wledHost));
 
-    snprintf(key, sizeof(key), "l%d_mapR", i);
-    lights[i].channelMap.red = prefs.getUChar(key, 0);
-
-    snprintf(key, sizeof(key), "l%d_mapG", i);
-    lights[i].channelMap.green = prefs.getUChar(key, 1);
-
-    snprintf(key, sizeof(key), "l%d_mapB", i);
-    lights[i].channelMap.blue = prefs.getUChar(key, 2);
-
-    snprintf(key, sizeof(key), "l%d_mapW", i);
-    lights[i].channelMap.white = prefs.getUChar(key, 3);
+    snprintf(key, sizeof(key), "l%d_port", i);
+    lights[i].wledPort = prefs.getUShort(key, 80);
 
     lights[i].active = true;
   }
 
   prefs.end();
-  ESP_LOGI("Config", "Loaded %d lights, output mode=%d from NVS", lightCount, outputCfg.mode);
+  ESP_LOGI("Config", "Loaded %d lights from NVS", lightCount);
 }
 
 void ConfigStore::toJson(JsonDocument& doc) const {
-  // Output config
-  JsonObject output = doc["output"].to<JsonObject>();
-  output["mode"] = (outputCfg.mode == OUTPUT_MODE_ARTNET) ? "artnet" : "dmx";
-  output["txPin"] = outputCfg.txPin;
-  output["enPin"] = outputCfg.enPin;
-  output["artnetUniverse"] = outputCfg.artnetUniverse;
-  if (outputCfg.artnetTargetIp[0] != '\0') {
-    output["artnetTargetIp"] = outputCfg.artnetTargetIp;
-  }
-
   // Lights
   JsonArray arr = doc["lights"].to<JsonArray>();
   for (uint8_t i = 0; i < lightCount; i++) {
     JsonObject light = arr.add<JsonObject>();
     light["name"] = lights[i].name;
     light["type"] = (lights[i].type == LIGHT_TYPE_RGBW) ? "RGBW" : "RGB";
-    light["dmxAddr"] = lights[i].dmxStartAddr;
-
-    JsonObject map = light["channelMap"].to<JsonObject>();
-    map["r"] = lights[i].channelMap.red;
-    map["g"] = lights[i].channelMap.green;
-    map["b"] = lights[i].channelMap.blue;
-    if (lights[i].type == LIGHT_TYPE_RGBW) {
-      map["w"] = lights[i].channelMap.white;
-    }
+    light["wledHost"] = lights[i].wledHost;
+    light["wledPort"] = lights[i].wledPort;
   }
 }
 
@@ -186,21 +132,6 @@ bool ConfigStore::fromJson(const JsonDocument& doc) {
     return false;
   }
 
-  // Parse output config if present
-  JsonObjectConst outputObj = doc["output"].as<JsonObjectConst>();
-  if (!outputObj.isNull()) {
-    const char* mode = outputObj["mode"] | "dmx";
-    outputCfg.mode = (strcmp(mode, "artnet") == 0) ? OUTPUT_MODE_ARTNET : OUTPUT_MODE_WIRED_DMX;
-    outputCfg.txPin = outputObj["txPin"] | (int)2;
-    outputCfg.enPin = outputObj["enPin"] | (int)4;
-    outputCfg.artnetUniverse = outputObj["artnetUniverse"] | (int)0;
-    const char* targetIp = outputObj["artnetTargetIp"] | "";
-    strlcpy(outputCfg.artnetTargetIp, targetIp, sizeof(outputCfg.artnetTargetIp));
-    ESP_LOGI("Config", "fromJson: output mode=%s txPin=%d enPin=%d artUni=%d targetIp=%s",
-             mode, outputCfg.txPin, outputCfg.enPin, outputCfg.artnetUniverse,
-             outputCfg.artnetTargetIp);
-  }
-
   uint8_t count = 0;
 
   for (JsonObjectConst light : arr) {
@@ -215,17 +146,10 @@ bool ConfigStore::fromJson(const JsonDocument& doc) {
     const char* type = light["type"] | "RGB";
     cfg.type = (strcmp(type, "RGBW") == 0) ? LIGHT_TYPE_RGBW : LIGHT_TYPE_RGB;
 
-    cfg.dmxStartAddr = light["dmxAddr"] | 1;
+    const char* host = light["wledHost"] | "";
+    strlcpy(cfg.wledHost, host, sizeof(cfg.wledHost));
 
-    if (light["channelMap"].is<JsonObjectConst>()) {
-      JsonObjectConst map = light["channelMap"].as<JsonObjectConst>();
-      cfg.channelMap.red   = map["r"] | 0;
-      cfg.channelMap.green = map["g"] | 1;
-      cfg.channelMap.blue  = map["b"] | 2;
-      cfg.channelMap.white = map["w"] | 3;
-    } else {
-      cfg.channelMap = {0, 1, 2, 3};
-    }
+    cfg.wledPort = light["wledPort"] | 80;
 
     count++;
   }
@@ -241,13 +165,12 @@ bool ConfigStore::fromJson(const JsonDocument& doc) {
 }
 
 void ConfigStore::factoryReset() {
-  prefs.begin("zbdmx", false);
+  prefs.begin("zbwled", false);
   prefs.clear();
   prefs.end();
 
   lightCount = 0;
   memset(lights, 0, sizeof(lights));
-  outputCfg = OutputConfig();
 
   ESP_LOGI("Config", "Factory reset complete");
 }

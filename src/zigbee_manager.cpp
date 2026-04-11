@@ -1,5 +1,5 @@
 /*
- * Zigbee DMX Bridge - Zigbee Manager Implementation
+ * Zigbee WLED Bridge - Zigbee Manager Implementation
  *
  * Adapted from the WLED Zigbee RGB Light usermod:
  * https://github.com/netmindz/WLED-MM/tree/zigbee-rgb-light-usermod/usermods/zigbee_rgb_light/
@@ -7,7 +7,7 @@
  * Key differences from the WLED version:
  * - Standalone (no WLED dependencies)
  * - Multiple Zigbee endpoints (one per configured light)
- * - Output goes to DMX rather than LED strip
+ * - Output goes to WLED devices via HTTP JSON API
  * - Each light has independent RGB state
  *
  * All critical Hue Bridge pairing requirements are preserved:
@@ -78,7 +78,7 @@ static SemaphoreHandle_t zbStateMutex = nullptr;
 static char eui64Str[24] = {};
 static bool reconfigPending = false;
 
-// Light states (written by Zigbee task, read by main loop for DMX)
+// Light states (written by Zigbee task, read by main loop for WLED output)
 static LightState lightStates[MAX_LIGHTS] = {};
 
 // ZLL distributed link key (well-known, used by Hue bridge)
@@ -755,7 +755,7 @@ static void createLightEndpoint(esp_zb_ep_list_t *ep_list, uint8_t endpoint, con
     cluster_list, ESP_ZB_ZCL_CLUSTER_ID_BASIC, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
   if (basic_cluster) {
     // ZCL string format: first byte = length
-    char manuf[] = "\x0A" "ZigbeeDMX";
+    char manuf[] = "\x0B" "ZigbeeWLED";
 
     // Build model identifier from name
     char model[34];
