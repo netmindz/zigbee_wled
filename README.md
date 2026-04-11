@@ -20,6 +20,7 @@ Hue Bridge  ──(Zigbee ZCL)──>  ESP32-C6  ──(DMX512 / ArtNet)──> 
 - **Config persistence** — all settings stored in NVS (ESP32 Preferences), survive reboots
 - **CIE XY and Hue/Saturation color support** — full color control from the Hue app
 - **Color temperature support** — Hue CT (mirek) commands are converted to RGB for DMX output
+- **RGBW white channel decomposition** — for RGBW fixtures, the white channel is automatically extracted from RGB values (`W = min(R, G, B)`) producing cleaner whites and more efficient fixture use
 - **Proven Hue Bridge compatibility** — implements all critical pairing requirements discovered through extensive testing (End Device mode, ZLL distributed security, app_device_version=1, raw ZCL command handling)
 
 ## Hardware Requirements
@@ -83,7 +84,7 @@ The web interface is accessible at `http://<device-ip>/` and provides:
 | `/api/status` | GET | Device status (WiFi SSID, Zigbee, output mode) |
 | `/api/config` | GET | Full configuration (lights + output settings) |
 | `/api/config` | POST | Update configuration (JSON body) |
-| `/api/lights/state` | GET | Current per-light RGB/brightness state |
+| `/api/lights/state` | GET | Current per-light RGB(W)/brightness state |
 | `/api/wifi` | POST | Set WiFi credentials (triggers restart) |
 | `/api/factory-reset` | POST | Erase all config and restart |
 
@@ -189,8 +190,9 @@ Test suites:
 - **brightness** — tests brightness scaling at multiple levels
 - **accuracy** — compares actual DMX values against expected values from the CIE XY -> RGB conversion
 - **colortemp** — tests color temperature (mirek) control and RGB conversion
+- **rgbw** — tests RGBW white channel decomposition accuracy and correctness across colors, brightness levels, and color temperatures
 
-The test auto-discovers all lights belonging to the device and runs all suites against each light independently. With 2 lights configured, the full suite runs 132 tests.
+The test auto-discovers all lights belonging to the device and runs all suites against each light independently. RGBW-specific tests run only against lights configured as RGBW. With 2 lights configured (1 RGB + 1 RGBW), the full suite runs 180 tests.
 
 ## Project Structure
 

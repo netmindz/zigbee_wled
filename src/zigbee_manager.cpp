@@ -218,6 +218,23 @@ static int endpointToIndex(uint8_t endpoint) {
   return idx;
 }
 
+// ---- RGB-to-RGBW decomposition ----
+// For RGBW lights, extract the white component (min of R,G,B) and subtract
+// it from each RGB channel. This lets the dedicated white LED handle the
+// achromatic portion for better color rendering and efficiency.
+// For RGB lights, white is always 0 and RGB values are unchanged.
+static void decomposeRGBW(int idx, uint8_t &r, uint8_t &g, uint8_t &b, uint8_t &w) {
+  if (idx >= 0 && idx < configStore.getLightCount() &&
+      configStore.getLight(idx).type == LIGHT_TYPE_RGBW) {
+    w = min(r, min(g, b));
+    r -= w;
+    g -= w;
+    b -= w;
+  } else {
+    w = 0;
+  }
+}
+
 // ---- Update light state from Zigbee command ----
 // transitionDs = transition time in deciseconds (tenths of a second), 0 = instant
 static void updateLightState(uint8_t endpoint, bool power, uint8_t bri,
@@ -244,11 +261,13 @@ static void updateLightState(uint8_t endpoint, bool power, uint8_t bri,
     lightStates[idx].powerOn = power;
     lightStates[idx].brightness = bri;
     if (useXY) {
-      uint8_t r, g, b;
+      uint8_t r, g, b, w;
       xyToRGB(colorX, colorY, r, g, b);
+      decomposeRGBW(idx, r, g, b, w);
       lightStates[idx].red = r;
       lightStates[idx].green = g;
       lightStates[idx].blue = b;
+      lightStates[idx].white = w;
     }
     xSemaphoreGive(zbStateMutex);
   }
@@ -296,9 +315,15 @@ static void updateLightStateHS(uint8_t endpoint, bool power, uint8_t bri,
 
     lightStates[idx].powerOn = power;
     lightStates[idx].brightness = bri;
-    lightStates[idx].red   = static_cast<uint8_t>((rf + m) * 255.0f);
-    lightStates[idx].green = static_cast<uint8_t>((gf + m) * 255.0f);
-    lightStates[idx].blue  = static_cast<uint8_t>((bf + m) * 255.0f);
+    uint8_t r_out = static_cast<uint8_t>((rf + m) * 255.0f);
+    uint8_t g_out = static_cast<uint8_t>((gf + m) * 255.0f);
+    uint8_t b_out = static_cast<uint8_t>((bf + m) * 255.0f);
+    uint8_t w_out;
+    decomposeRGBW(idx, r_out, g_out, b_out, w_out);
+    lightStates[idx].red   = r_out;
+    lightStates[idx].green = g_out;
+    lightStates[idx].blue  = b_out;
+    lightStates[idx].white = w_out;
     xSemaphoreGive(zbStateMutex);
   }
 }
@@ -308,8 +333,9 @@ static void updateLightStateCT(uint8_t endpoint, bool power, uint8_t bri,
   int idx = endpointToIndex(endpoint);
   if (idx < 0) return;
 
-  uint8_t r, g, b;
+  uint8_t r, g, b, w;
   mirekToRGB(mirek, r, g, b);
+  decomposeRGBW(idx, r, g, b, w);
 
   if (zbStateMutex && xSemaphoreTake(zbStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     if (transitionDs > 0 && lightStates[idx].powerOn && power) {
@@ -330,6 +356,7 @@ static void updateLightStateCT(uint8_t endpoint, bool power, uint8_t bri,
     lightStates[idx].red = r;
     lightStates[idx].green = g;
     lightStates[idx].blue = b;
+    lightStates[idx].white = w;
     xSemaphoreGive(zbStateMutex);
   }
 }
@@ -465,19 +492,23 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
           // Read both X and Y from attribute cache
           uint16_t x, y;
           readCurrentColorXY(endpoint, x, y);
-          uint8_t r, g, b;
+          uint8_t r, g, b, w;
           xyToRGB(x, y, r, g, b);
+          decomposeRGBW(idx, r, g, b, w);
           lightStates[idx].red = r;
           lightStates[idx].green = g;
           lightStates[idx].blue = b;
+          lightStates[idx].white = w;
         } else if (attrId == ESP_ZB_ZCL_ATTR_COLOR_CONTROL_COLOR_TEMPERATURE_ID) {
           // Color temperature (mirek) changed via attribute write
           uint16_t mirek = *(const uint16_t *)msg->attribute.data.value;
-          uint8_t r, g, b;
+          uint8_t r, g, b, w;
           mirekToRGB(mirek, r, g, b);
+          decomposeRGBW(idx, r, g, b, w);
           lightStates[idx].red = r;
           lightStates[idx].green = g;
           lightStates[idx].blue = b;
+          lightStates[idx].white = w;
         }
         break;
     }
@@ -857,18 +888,20 @@ void zigbeeSetup() {
   for (int i = 0; i < MAX_LIGHTS; i++) {
     lightStates[i].powerOn = true;
     lightStates[i].brightness = 254;
-    lightStates[i].red = 255;
-    lightStates[i].green = 255;
-    lightStates[i].blue = 255;
-    lightStates[i].white = 0;
+    uint8_t r = 255, g = 255, b = 255, w;
+    decomposeRGBW(i, r, g, b, w);
+    lightStates[i].red = r;
+    lightStates[i].green = g;
+    lightStates[i].blue = b;
+    lightStates[i].white = w;
     lightStates[i].transitioning = false;
     lightStates[i].transitionStart = 0;
     lightStates[i].transitionEnd = 0;
     lightStates[i].startBrightness = 254;
-    lightStates[i].startRed = 255;
-    lightStates[i].startGreen = 255;
-    lightStates[i].startBlue = 255;
-    lightStates[i].startWhite = 0;
+    lightStates[i].startRed = r;
+    lightStates[i].startGreen = g;
+    lightStates[i].startBlue = b;
+    lightStates[i].startWhite = w;
   }
 
   // Configure Zigbee platform

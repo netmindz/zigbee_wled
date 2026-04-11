@@ -40,6 +40,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Zigbee DMX Bridge</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231a1a2e'/%3E%3Cpath d='M18 4L8 18h6l-2 10 10-14h-6z' fill='%2300d4ff'/%3E%3C/svg%3E">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -283,8 +284,13 @@ async function loadLightStates() {
       if (!el) continue;
       const l = lights[i];
       if (l.on) {
-        el.style.background = 'rgb(' + l.r + ',' + l.g + ',' + l.b + ')';
-        el.style.boxShadow = '0 0 8px rgba(' + l.r + ',' + l.g + ',' + l.b + ',0.5)';
+        // For RGBW lights, add white back into RGB for preview (screen can't show separate W)
+        const pw = l.w || 0;
+        const pr = Math.min(255, l.r + pw);
+        const pg = Math.min(255, l.g + pw);
+        const pb = Math.min(255, l.b + pw);
+        el.style.background = 'rgb(' + pr + ',' + pg + ',' + pb + ')';
+        el.style.boxShadow = '0 0 8px rgba(' + pr + ',' + pg + ',' + pb + ',0.5)';
       } else {
         el.style.background = '#111';
         el.style.boxShadow = 'none';
@@ -601,6 +607,7 @@ static void setupRoutes() {
       obj["r"] = static_cast<uint8_t>(st.red * briScale);
       obj["g"] = static_cast<uint8_t>(st.green * briScale);
       obj["b"] = static_cast<uint8_t>(st.blue * briScale);
+      obj["w"] = static_cast<uint8_t>(st.white * briScale);
     }
     String json;
     serializeJson(doc, json);

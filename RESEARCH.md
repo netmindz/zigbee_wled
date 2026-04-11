@@ -8,6 +8,7 @@ Technical background, discoveries, and design decisions for the Zigbee DMX Bridg
 - [Hue Bridge Pairing Requirements](#hue-bridge-pairing-requirements)
 - [Raw ZCL Command Handling](#raw-zcl-command-handling)
 - [CIE XY Color Conversion](#cie-xy-color-conversion)
+- [RGBW White Channel Decomposition](#rgbw-white-channel-decomposition)
 - [WiFi / 802.15.4 Coexistence](#wifi--802154-coexistence)
 - [Multi-Endpoint Discovery Problem](#multi-endpoint-discovery-problem)
 - [ESP-Zigbee SDK Internals](#esp-zigbee-sdk-internals)
@@ -304,6 +305,77 @@ Standard HSV-to-RGB conversion is used with six 60-degree segments.
 
 ---
 
+## RGBW White Channel Decomposition
+
+### Background
+
+All lights are presented as RGB to the Zigbee/Hue Bridge regardless of whether they are RGB or RGBW on the DMX side. The Hue Bridge only sends RGB color data (via CIE XY, Hue/Saturation, or Color Temperature commands). For RGBW fixtures, the firmware must extract the white component from the RGB values and output it on the separate white DMX channel.
+
+### Algorithm
+
+The decomposition uses a simple subtractive method:
+
+```
+W = min(R, G, B)
+R' = R - W
+G' = G - W
+B' = B - W
+```
+
+This produces:
+- **Pure white** (255, 255, 255) → R'=0, G'=0, B'=0, W=255 — fully on white channel
+- **Warm white** (255, 180, 100) → R'=155, G'=80, B'=0, W=100 — partial white + color
+- **Pure red** (255, 0, 0) → R'=255, G'=0, B'=0, W=0 — no white extraction
+- **Light pink** (255, 200, 200) → R'=55, G'=0, B'=0, W=200 — mostly white + red tint
+
+### Implementation
+
+The `decomposeRGBW()` function is defined in `src/zigbee_manager.cpp` (~line 222):
+
+```cpp
+static void decomposeRGBW(uint8_t r, uint8_t g, uint8_t b,
+                          uint8_t &rOut, uint8_t &gOut, uint8_t &bOut, uint8_t &wOut) {
+    uint8_t w = min(r, min(g, b));
+    rOut = r - w;
+    gOut = g - w;
+    bOut = b - w;
+    wOut = w;
+}
+```
+
+It is applied in **all 6 code paths** that set RGB values on a light:
+1. `updateLightState()` — XY color updates from raw ZCL handler
+2. `updateLightStateHS()` — Hue/Saturation updates
+3. `updateLightStateCT()` — Color Temperature updates
+4. `SET_ATTR_VALUE_CB` for XY — attribute write callback
+5. `SET_ATTR_VALUE_CB` for CT — attribute write callback
+6. Init defaults — initial state at startup
+
+The decomposition is only applied for lights with `configStore.getLight(idx).type == LIGHT_TYPE_RGBW`. RGB lights pass through unchanged with W=0.
+
+### Why Decompose at Color-Set Time?
+
+The decomposition is applied when the color is received from Zigbee, not when DMX output is generated. This means the `LightState` struct always holds the decomposed values. Benefits:
+- The web UI `/api/lights/state` endpoint can report the white channel value directly
+- The DMX output code doesn't need to know about light types — it just outputs R, G, B, W from the state
+- The live preview in the web UI can add W back into RGB for accurate color display
+
+### Color Temperature and RGBW
+
+Color temperature (CT) commands produce warm-to-cool whites that benefit significantly from RGBW decomposition. For example:
+- **Warm white** (CT=454 mirek / 2200K) → RGB ≈ (255, 166, 87) → W=87, R'=168, G'=79, B'=0
+- **Neutral white** (CT=333 mirek / 3000K) → RGB ≈ (255, 209, 163) → W=163, R'=92, G'=46, B'=0
+- **Daylight** (CT=250 mirek / 4000K) → RGB ≈ (255, 232, 209) → W=209, R'=46, G'=23, B'=0
+- **Cool white** (CT=153 mirek / 6500K) → RGB ≈ (255, 254, 250) → W=250, R'=5, G'=4, B'=0
+
+Cool whites are almost entirely handled by the white channel, which produces much cleaner output on RGBW fixtures than mixing R+G+B to approximate white.
+
+### Web UI Integration
+
+The `/api/lights/state` endpoint returns a `"w"` field for each light (0 for RGB lights, decomposed value for RGBW lights). The live preview JavaScript adds the white value back into the RGB display color so the preview matches the expected visual output of the fixture.
+
+---
+
 ## WiFi / 802.15.4 Coexistence
 
 The ESP32-C6 has a single 2.4GHz radio shared between WiFi and 802.15.4 (Zigbee). The coexistence mechanism time-multiplexes access.
@@ -480,7 +552,7 @@ Offset  Size  Field              Notes
 - **Data Length:** Always 512 in our implementation (full universe). Must be even per spec.
 - **Universe encoding:** The 15-bit universe field combines Net (bits 14-8), Sub-Net (bits 7-4), and Universe (bits 3-0). For simple use, the entire 15-bit value is the universe number.
 - **DMX Data:** Channels 1-512 in the packet correspond to `dmxData[1]` through `dmxData[512]` in our buffer. `dmxData[0]` (the DMX start code) is not transmitted in ArtNet.
-- **Frame rate:** We send at the main loop rate (~40Hz). Art-Net receivers typically expect 1-44Hz.
+- **Frame rate:** We send at ~2Hz (500ms interval) to avoid ENOMEM errors under WiFi/802.15.4 coexistence. Art-Net receivers typically expect 1-44Hz.
 
 ---
 
@@ -596,8 +668,9 @@ This project is adapted from the WLED Zigbee RGB Light usermod:
 - **Bridge IP:** `192.168.178.216`
 - **Zigbee Channel:** 25
 - **Device WiFi IP:** `192.168.178.110` on "MilliWatt" network
-- **Light ID on bridge:** #25 (after re-pairing)
-- **Metadata:** manufacturer "ZigbeeDMX", model "Test Light 1", type "Color light", reachable=true
+- **Light IDs on bridge:** #26 (endpoint 10, RGB) and #27 (endpoint 20, RGBW)
+- **Metadata:** manufacturer "ZigbeeDMX", model "Test Light 1"/"Test Light 2", type "Extended color light", reachable=true
+- **Integration test:** 178/180 pass (2 transient timing failures on CT propagation)
 
 ---
 
@@ -621,17 +694,12 @@ All issues at: https://github.com/espressif/esp-zigbee-sdk/issues/
 
 ### High Priority
 
-- **Test integration test end-to-end** — flash ArtNet firmware, run `tools/integration_test.py`, verify all tests pass
-- **Investigate Hue Bridge multi-endpoint** further — try repeated search cycles, or test with deCONZ/Phoscon as an alternative coordinator
-- **OTA firmware updates** — the partition table has two OTA slots, but no update mechanism is implemented yet
+- **Zigbee state reporting** — implement `zigbeeReportState()` to send attribute reports back to the coordinator when state changes from the web UI
 
 ### Medium Priority
 
-- **Color temperature support** — the Hue app sends color temperature (mirek) for warm/cool white. Currently only CIE XY and HS are handled. CT could be mapped to RGBW white channel.
-- **Transition time handling** — ZCL move_to_color and move_to_level include transition time fields. Currently ignored (instant transitions).
-- **Web UI improvements** — output mode change should trigger immediate reconfigure without requiring manual restart
 - **mDNS/service discovery** — advertise the web UI via mDNS so it's discoverable without knowing the IP
-- **Zigbee state reporting** — implement `zigbeeReportState()` to send attribute reports back to the coordinator when state changes from the web UI
+- **Web UI improvements** — output mode change should trigger immediate reconfigure without requiring manual restart
 
 ### Low Priority
 
@@ -639,6 +707,5 @@ All issues at: https://github.com/espressif/esp-zigbee-sdk/issues/
 - **deCONZ DDF file** — write a device description file for deCONZ/Phoscon
 - **Scene support** — implement ZCL scene storage so Hue scenes work properly
 - **Power-on behavior** — configure what happens when the device powers on (restore last state, default white, etc.)
-- **Rate limiting** — ArtNet output at 40Hz is typical but some receivers expect lower rates. Make configurable.
-- **Directed ArtNet** — send ArtNet to a specific IP instead of broadcast (reduces network load)
+- **Rate limiting** — ArtNet output rate is currently fixed at 2Hz. Some receivers may prefer higher rates. Make configurable (with coexistence-aware upper bound).
 - **ESP-DMX library integration** — use the esp_dmx library (with PR #223 fix) for more robust DMX timing instead of raw UART baud-rate switching
