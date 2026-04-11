@@ -1,36 +1,34 @@
-# Zigbee DMX Bridge
+# Zigbee WLED Bridge
 
-ESP32-C6 firmware that bridges Philips Hue (Zigbee) to DMX512 lighting fixtures. Each configured light appears as a separate Zigbee Extended Color Light on the Hue Bridge and outputs color/brightness via wired DMX512 or ArtNet (UDP).
+ESP32-C6 firmware that bridges Philips Hue (Zigbee) to [WLED](https://kno.wled.ge/) devices on the local network. Each configured WLED device appears as a separate Zigbee Extended Color Light on the Hue Bridge and is controlled via the WLED JSON API over HTTP.
 
 ```
-Hue Bridge  ──(Zigbee ZCL)──>  ESP32-C6  ──(DMX512 / ArtNet)──>  RGB/RGBW fixtures
+Hue Bridge  ──(Zigbee ZCL)──>  ESP32-C6  ──(HTTP JSON API)──>  WLED devices
                                     │
                               Web config UI
-                            (light definitions,
-                             output settings)
+                            (WLED discovery,
+                             light definitions)
 ```
 
 ## Features
 
-- **Browser-based installer** — flash directly from [netmindz.github.io/zigbee_dmx](https://netmindz.github.io/zigbee_dmx/) using ESP Web Tools (Chrome/Edge, no build tools needed)
-- **Hue-compatible Zigbee endpoints** — each configured light appears as a separate Extended Color Light (device ID 0x010D) on the Philips Hue Bridge, with full multi-endpoint discovery support
-- **Dual output modes** — wired DMX512 via RS-485 transceiver, or ArtNet (Art-Net DMX over UDP unicast/broadcast), selectable from the web UI
-- **Up to 16 RGB/RGBW lights** — each with configurable DMX start address and channel-to-offset mapping
-- **Web configuration UI** — captive portal for initial WiFi setup, light management, output mode selection
+- **Hue-compatible Zigbee endpoints** — each configured WLED device appears as a separate Extended Color Light (device ID 0x010D) on the Philips Hue Bridge, with full multi-endpoint discovery support
+- **WLED device discovery** — mDNS-based network scan finds WLED devices automatically; select from a list in the web UI
+- **Up to 16 WLED lights** — each mapped to a WLED device by IP or hostname
+- **Web configuration UI** — captive portal for initial WiFi setup, WLED device discovery, light management
 - **Config persistence** — all settings stored in NVS (ESP32 Preferences), survive reboots
 - **CIE XY and Hue/Saturation color support** — full color control from the Hue app
-- **Color temperature support** — Hue CT (mirek) commands are converted to RGB for DMX output
-- **RGBW white channel decomposition** — for RGBW fixtures, the white channel is automatically extracted from RGB values (`W = min(R, G, B)`) producing cleaner whites and more efficient fixture use
+- **Color temperature support** — Hue CT (mirek) commands are converted to RGB for WLED output
+- **RGBW white channel decomposition** — for WLED devices with RGBW LEDs, the white channel is automatically extracted from RGB values (`W = min(R, G, B)`) and sent as a 4-element color array
+- **Change detection** — only sends HTTP updates when light state actually changes, minimizing network traffic
 - **Proven Hue Bridge compatibility** — implements all critical pairing requirements discovered through extensive testing (End Device mode, ZLL distributed security, app_device_version=1, raw ZCL command handling)
 
 ## Hardware Requirements
 
-- **ESP32-C6-DevKitC-1** (8MB flash) — or any ESP32-C6 board with 802.15.4 radio
-- **RS-485 transceiver** (MAX485, SN75176, etc.) — for wired DMX512 output
-  - TX pin and enable pin configurable via web UI (defaults: GPIO2 TX, GPIO4 EN)
-- **DMX512-compatible fixtures** — RGB or RGBW LED pars, wash lights, etc.
+- **ESP32-C6-DevKitC-1** (4MB or 8MB flash) — or any ESP32-C6 board with 802.15.4 radio
+- **WLED devices** on the same local network — any ESP8266/ESP32 running WLED firmware
 
-For ArtNet mode, no additional hardware is needed beyond the ESP32-C6 and a WiFi network.
+No additional hardware beyond the ESP32-C6 is needed. The bridge communicates with WLED devices over WiFi.
 
 ## Building
 
@@ -40,10 +38,13 @@ This is a PlatformIO project targeting the ESP32-C6 with Arduino framework and E
 # Install PlatformIO CLI (if not already installed)
 pip install platformio
 
-# Build
+# Build (default 4MB flash)
 pio run
 
-# Build and upload
+# Build for 8MB flash variant
+pio run -e esp32c6-8mb
+
+# Build and upload via USB serial
 pio run -t upload
 
 # Monitor serial output
@@ -52,59 +53,76 @@ pio device monitor -b 115200
 
 ### Partition Table
 
-The firmware uses a custom 8MB partition layout (`partitions/zigbee_dmx_8MB.csv`) that includes:
-- Two OTA app partitions (3MB each)
+The firmware uses custom partition layouts (`partitions/zigbee_dmx_4MB.csv` / `zigbee_dmx_8MB.csv`) that include:
+- App partition(s) for the firmware
 - NVS for configuration storage
 - `zb_storage` and `zb_fct` partitions required by the Zigbee stack
-- SPIFFS partition for future use
 
 ## First-Time Setup
 
 1. **Flash the firmware** to the ESP32-C6
-2. **Connect to the captive portal** — the device starts a WiFi AP named `ZigbeeDMX-Setup` (open, no password)
+2. **Connect to the captive portal** — the device starts a WiFi AP named `ZigbeeWLED-Setup` (open, no password)
 3. **Configure WiFi** — enter your network SSID and password in the web UI. The device restarts and connects to your network.
 4. **Access the web UI** — browse to the device's IP address (check serial output or your router's DHCP table)
-5. **Add lights** — define your DMX fixtures with name, type (RGB/RGBW), DMX start address, and channel mapping
-6. **Configure output** — select Wired DMX or ArtNet mode, set pin assignments or ArtNet universe
-7. **Pair with Hue Bridge** — open the Hue app, go to Settings > Lights > Search. The device should appear as a new light.
+5. **Add lights** — click "+ Add Light", use the "Scan" button to discover WLED devices on the network, select one, and save
+6. **Pair with Hue Bridge** — open the Hue app, go to Settings > Lights > Search. The device should appear as a new light.
 
 ## Web UI
 
 The web interface is accessible at `http://<device-ip>/` and provides:
 
 - **Status bar** — WiFi connection, Zigbee pairing status, light count
-- **Light configuration** — add, edit, delete lights with DMX address and channel mapping
-- **Output settings** — switch between wired DMX and ArtNet, configure pins/universe
+- **Light configuration** — add, edit, delete lights mapped to WLED devices
+- **WLED discovery** — scan the network for WLED devices via mDNS, showing device name, IP, LED count, RGB/RGBW type, and firmware version
+- **OTA firmware update** — upload firmware binaries via the browser
 - **Factory reset** — clears all configuration including WiFi credentials
 
 ### REST API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/status` | GET | Device status (WiFi SSID, Zigbee, output mode) |
-| `/api/config` | GET | Full configuration (lights + output settings) |
+| `/api/status` | GET | Device status (WiFi SSID, Zigbee state) |
+| `/api/config` | GET | Full configuration (lights array) |
 | `/api/config` | POST | Update configuration (JSON body) |
 | `/api/lights/state` | GET | Current per-light RGB(W)/brightness state |
+| `/api/wled/discover` | GET | Scan network for WLED devices via mDNS |
 | `/api/wifi` | POST | Set WiFi credentials (triggers restart) |
 | `/api/factory-reset` | POST | Erase all config and restart |
+| `/api/restart` | POST | Restart the device |
+| `/api/ota` | POST | Upload firmware binary (multipart form) |
 
-## Output Modes
+## WLED Integration
 
-### Wired DMX512
+### How It Works
 
-Uses UART1 at 250kbaud through an RS-485 transceiver. The BREAK signal is generated by temporarily switching to a lower baud rate (~91kbaud). The transceiver enable pin is held HIGH during transmission.
+The bridge sends HTTP POST requests to each configured WLED device's `/json/state` endpoint:
 
-Default pin assignment (configurable via web UI):
-- TX: GPIO2
-- EN: GPIO4 (-1 to disable)
+- **Set color:** `{"on":true,"bri":B,"seg":[{"fx":0,"col":[[R,G,B]]}]}`
+- **Set RGBW color:** `{"on":true,"bri":B,"seg":[{"fx":0,"col":[[R,G,B,W]]}]}`
+- **Turn off:** `{"on":false}`
 
-### ArtNet
+The `fx:0` forces the "Solid" effect so color changes are immediate regardless of what effect was previously active on the WLED device.
 
-Sends Art-Net OpDmx (0x5000) UDP packets at ~2Hz. Supports unicast to a configurable target IP (recommended) or broadcast to 255.255.255.255. Compatible with any ArtNet-capable DMX node or software (e.g., OLA, QLC+, MagicQ).
+### Brightness Mapping
 
-Settings (configurable via web UI):
-- Universe: 0-32767
-- Target IP: unicast address (leave blank for broadcast)
+Zigbee level control sends brightness as 0-254. WLED accepts 0-255. The bridge maps accordingly (254 -> 255, values 1-253 are incremented by 1).
+
+### Rate Limiting
+
+Updates are sent at most every 500ms (~2Hz). Additionally, the bridge tracks last-sent state per light and only sends HTTP requests when the state has actually changed. This avoids flooding WLED devices, which is especially important under WiFi/Zigbee coexistence where network capacity is limited.
+
+### RGBW Support
+
+If a light is configured as RGBW type, the bridge sends a 4-element color array `[R,G,B,W]` to the WLED device. The white channel is decomposed from the RGB values using `W = min(R, G, B)` with the remaining color subtracted from each channel.
+
+### Device Discovery
+
+The bridge uses mDNS to find WLED devices. WLED devices advertise as `_http._tcp` services with hostnames typically starting with `wled-`. For each discovered device, the bridge queries `/json/info` to retrieve:
+- Device name
+- LED count
+- RGBW capability
+- MAC address
+- Firmware version
 
 ## Hue Bridge Pairing
 
@@ -123,7 +141,7 @@ The firmware implements several critical requirements for Philips Hue Bridge V2 
 
 ### Multi-Endpoint Support
 
-Each configured light gets its own Zigbee endpoint with spaced numbering (endpoints 10, 20, 30, ...) and device ID `0x010D` (Extended Color Light). This matches the approach used by commercial multi-output Zigbee controllers (e.g., Gledopto 2ID) and ensures the Hue Bridge discovers all endpoints as separate lights.
+Each configured light gets its own Zigbee endpoint with spaced numbering (endpoints 10, 20, 30, ...) and device ID `0x010D` (Extended Color Light). This matches the approach used by commercial multi-output Zigbee controllers and ensures the Hue Bridge discovers all endpoints as separate lights.
 
 **After changing the number of lights**, you must:
 1. Restart the device (endpoints are registered at Zigbee stack startup)
@@ -163,58 +181,30 @@ python3 tools/hue_debug.py --delete-light 25
 
 The API key is auto-generated on first use (requires pressing the Hue Bridge link button) and persisted to `.hue_api_key` (git-ignored).
 
-### Integration Test
-
-End-to-end test that verifies Hue API light state changes are reflected in ArtNet DMX output.
-
-```bash
-# Prerequisites
-pip install requests
-
-# Run tests against a paired device
-python3 tools/integration_test.py --device-ip 192.168.178.110
-
-# Specify bridge IP and light ID explicitly
-python3 tools/integration_test.py --bridge-ip 192.168.178.216 --light-id 25
-
-# Run specific test suite
-python3 tools/integration_test.py --device-ip 192.168.178.110 --test color
-
-# Skip ArtNet verification (Hue API round-trip only)
-python3 tools/integration_test.py --device-ip 192.168.178.110 --skip-artnet
-```
-
-Test suites:
-- **onoff** — verifies ON/OFF state propagates to DMX channels
-- **color** — tests saturated red/green/blue via CIE xy coordinates
-- **brightness** — tests brightness scaling at multiple levels
-- **accuracy** — compares actual DMX values against expected values from the CIE XY -> RGB conversion
-- **colortemp** — tests color temperature (mirek) control and RGB conversion
-- **rgbw** — tests RGBW white channel decomposition accuracy and correctness across colors, brightness levels, and color temperatures
-
-The test auto-discovers all lights belonging to the device and runs all suites against each light independently. RGBW-specific tests run only against lights configured as RGBW. With 2 lights configured (1 RGB + 1 RGBW), the full suite runs 180 tests.
-
 ## Project Structure
 
 ```
-zigbee_dmx/
+zigbee_wled/
 ├── platformio.ini              # PlatformIO configuration
 ├── partitions/
+│   ├── zigbee_dmx_4MB.csv     # Custom 4MB partition table
 │   └── zigbee_dmx_8MB.csv     # Custom 8MB partition table
 ├── include/
 │   ├── config_store.h          # Configuration types and storage API
-│   ├── dmx_output.h            # DMX output (wired + ArtNet)
+│   ├── wled_output.h           # WLED JSON API output
+│   ├── wled_discovery.h        # mDNS WLED device discovery
 │   ├── web_ui.h                # Web server and WiFi management
 │   └── zigbee_manager.h        # Zigbee stack management
 ├── src/
 │   ├── main.cpp                # Entry point, main loop
 │   ├── config_store.cpp        # NVS persistence, JSON serialization
-│   ├── dmx_output.cpp          # Wired DMX (UART) and ArtNet (UDP) output
+│   ├── wled_output.cpp         # HTTP POST to WLED /json/state
+│   ├── wled_discovery.cpp      # mDNS scan + /json/info query
 │   ├── web_ui.cpp              # Web UI, REST API, captive portal
 │   └── zigbee_manager.cpp      # Zigbee endpoints, Hue compatibility
 └── tools/
     ├── hue_debug.py            # Hue Bridge query/debug tool
-    └── integration_test.py     # End-to-end ArtNet verification test
+    └── integration_test.py     # End-to-end verification test
 ```
 
 ## Configuration JSON Format
@@ -223,40 +213,47 @@ The configuration exchanged via `/api/config` follows this format:
 
 ```json
 {
-  "output": {
-    "mode": "artnet",
-    "txPin": 2,
-    "enPin": 4,
-    "artnetUniverse": 0
-  },
   "lights": [
     {
-      "name": "Stage Left",
+      "name": "Living Room Strip",
       "type": "RGB",
-      "dmxAddr": 1,
-      "channelMap": { "r": 0, "g": 1, "b": 2 }
+      "wledHost": "192.168.1.50",
+      "wledPort": 80
     },
     {
-      "name": "Stage Right",
+      "name": "Bedroom Lamp",
       "type": "RGBW",
-      "dmxAddr": 4,
-      "channelMap": { "r": 0, "g": 1, "b": 2, "w": 3 }
+      "wledHost": "wled-abcdef.local",
+      "wledPort": 80
     }
   ]
 }
 ```
 
+## Relationship to zigbee_dmx
+
+This project is a fork of [zigbee_dmx](https://github.com/netmindz/zigbee_dmx), which bridges Hue to DMX512/ArtNet fixtures. The Zigbee stack, Hue pairing logic, color conversion, and RGBW decomposition are shared. The key difference is the output stage:
+
+| | zigbee_dmx | zigbee_wled |
+|---|---|---|
+| **Output** | DMX512 (RS-485) or ArtNet (UDP) | WLED JSON API (HTTP) |
+| **Hardware** | RS-485 transceiver + DMX fixtures | WiFi only + WLED devices |
+| **Config per light** | DMX address + channel map | WLED host + port |
+| **Discovery** | N/A (manual DMX addressing) | mDNS network scan |
+
 ## Known Issues
 
 - **Zigbee reconfiguration requires restart** — changing the number of lights requires a device reboot and re-pair for Zigbee endpoints to be recreated (endpoints are registered at stack startup and cannot be dynamically changed).
-- **WiFi/Zigbee coexistence** — the 2.4GHz WiFi and 802.15.4 Zigbee share the same radio band. Coexistence is enabled, but expect 1-2s ping latency and occasional packet loss. HTTP requests to the device should use generous timeouts (20s) and retries.
+- **WiFi/Zigbee coexistence** — the 2.4GHz WiFi and 802.15.4 Zigbee share the same radio band. Coexistence is enabled, but expect 1-2s ping latency and occasional packet loss. HTTP requests (including those to WLED devices) use generous timeouts (20s).
 - **OTA unreliable** — firmware uploads over WiFi frequently fail due to coexistence. Use USB serial for flashing.
+- **HTTP latency** — under heavy Zigbee traffic, HTTP requests to WLED devices may take several seconds. The 2Hz update rate and change-detection logic mitigate this.
 
 ## References
 
+- [WLED JSON API Documentation](https://kno.wled.ge/interfaces/json-api/) — WLED state control and info endpoints
 - [ESP-Zigbee SDK](https://github.com/espressif/esp-zigbee-sdk) — Espressif's Zigbee stack
 - [WLED Zigbee RGB Light Usermod](https://github.com/netmindz/WLED-MM/tree/zigbee-rgb-light-usermod/usermods/zigbee_rgb_light/) — reference implementation this project was adapted from
-- [Art-Net Protocol Specification](https://art-net.org.uk/resources/art-net-specification/) — Art-Net 4 protocol documentation
+- [zigbee_dmx](https://github.com/netmindz/zigbee_dmx) — parent project (DMX512/ArtNet output variant)
 - [Zigbee Cluster Library (ZCL)](https://csa-iot.org/developer-resource/specifications-download-request/) — ZCL specification for color control, on/off, level control clusters
 
 ## License

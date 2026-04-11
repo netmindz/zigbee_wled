@@ -1,6 +1,6 @@
 # Research Notes
 
-Technical background, discoveries, and design decisions for the Zigbee DMX Bridge project. This document is intended for developers continuing work on the firmware. See `README.md` for usage instructions.
+Technical background, discoveries, and design decisions for the Zigbee WLED Bridge project. This document is intended for developers continuing work on the firmware. See `README.md` for usage instructions.
 
 ## Table of Contents
 
@@ -12,8 +12,8 @@ Technical background, discoveries, and design decisions for the Zigbee DMX Bridg
 - [WiFi / 802.15.4 Coexistence](#wifi--802154-coexistence)
 - [Multi-Endpoint Discovery Problem](#multi-endpoint-discovery-problem)
 - [ESP-Zigbee SDK Internals](#esp-zigbee-sdk-internals)
-- [ArtNet Protocol](#artnet-protocol)
-- [DMX512 Protocol](#dmx512-protocol)
+- [WLED JSON API](#wled-json-api)
+- [WLED Device Discovery](#wled-device-discovery)
 - [Build Environment and Library Issues](#build-environment-and-library-issues)
 - [Runtime Bugs Found and Fixed](#runtime-bugs-found-and-fixed)
 - [Reference Implementation](#reference-implementation)
@@ -35,16 +35,16 @@ The firmware runs on an ESP32-C6 which has both a 2.4GHz WiFi radio and a native
                            │                       │
   Browser ────(WiFi/HTTP)──┤  WebServer + REST API │
                            │                       │
-  DMX Fixtures ──(RS-485)──┤  UART1 @ 250kbaud     │
-       or                  │       or               │
-  ArtNet Node ──(UDP)──────┤  WiFiUDP broadcast     │
+  WLED Devices ──(HTTP)────┤  HTTPClient POST to   │
+                           │  /json/state endpoint │
                            └──────────────────────┘
 ```
 
 **Threading model:**
 - The Zigbee stack runs in its own FreeRTOS task (`zigbeeTask`, 16KB stack, priority 5). It calls `esp_zb_stack_main_loop()` which never returns.
-- The Arduino `loop()` runs on the default task and handles the web server and DMX output at ~40Hz.
+- The Arduino `loop()` runs on the default task and handles the web server and WLED output at ~2Hz.
 - Light state is shared between the Zigbee task and the main loop via `lightStates[]` protected by `zbStateMutex`.
+- The WLED output loop reads the current light states, applies transition interpolation if active, and sends HTTP POST requests to each WLED device only when state has changed.
 
 **Why not ESPHome?** ESPHome has no native Zigbee End Device support. The Hue-specific workarounds (ZLL distributed key, raw command handler for off_with_effect, crash prevention for manufacturer scene commands) require deep access to ZBOSS internals that ESPHome doesn't expose.
 
@@ -149,7 +149,7 @@ Attributes for on/off, level, color_x, color_y must have the reporting flag set.
 Basic cluster string attributes (manufacturer name, model identifier, software build) use ZCL string format where the **first byte is the string length**:
 
 ```cpp
-char manuf[] = "\x0A" "ZigbeeDMX";   // length 10 = 0x0A
+char manuf[] = "\x0B" "ZigbeeWLED";  // length 11 = 0x0B
 char sw[] = "\x05" "0.1.0";          // length 5 = 0x05
 ```
 
@@ -285,14 +285,14 @@ Used for `rgbToXY()` but not currently called in the firmware (it exists for pot
 
 ### Brightness Scaling
 
-Brightness from Zigbee (level control cluster, 0-254) is applied as a linear scale in the DMX output stage, not in the color conversion:
+Brightness from Zigbee (level control cluster, 0-254) is applied at the WLED output stage via the WLED `bri` field, not in the color conversion. The WLED device handles brightness scaling internally — the bridge sends full-intensity RGB color values and a separate brightness value:
 
 ```cpp
-float briScale = state.powerOn ? (brightness / 254.0f) : 0.0f;
-dmx_r = (uint8_t)(state.red * briScale);
+doc["bri"] = wledBri;
+seg0["col"][0] = [R, G, B];  // full intensity
 ```
 
-This means at brightness 127, a pure red (255, 0, 0) becomes DMX value (127, 0, 0).
+This differs from the DMX variant where brightness was scaled into the RGB channel values. Using WLED's native brightness control produces smoother dimming since WLED applies its own gamma correction.
 
 ### Hue/Saturation to RGB
 
@@ -309,7 +309,7 @@ Standard HSV-to-RGB conversion is used with six 60-degree segments.
 
 ### Background
 
-All lights are presented as RGB to the Zigbee/Hue Bridge regardless of whether they are RGB or RGBW on the DMX side. The Hue Bridge only sends RGB color data (via CIE XY, Hue/Saturation, or Color Temperature commands). For RGBW fixtures, the firmware must extract the white component from the RGB values and output it on the separate white DMX channel.
+All lights are presented as RGB to the Zigbee/Hue Bridge regardless of whether the WLED device has RGB or RGBW LEDs. The Hue Bridge only sends RGB color data (via CIE XY, Hue/Saturation, or Color Temperature commands). For RGBW WLED devices, the firmware must extract the white component from the RGB values and send it as a separate white channel value.
 
 ### Algorithm
 
@@ -353,11 +353,25 @@ It is applied in **all 6 code paths** that set RGB values on a light:
 
 The decomposition is only applied for lights with `configStore.getLight(idx).type == LIGHT_TYPE_RGBW`. RGB lights pass through unchanged with W=0.
 
+### WLED Color Array Format
+
+For RGBW WLED devices, the decomposed values are sent as a 4-element array in the WLED JSON API:
+
+```json
+{"seg":[{"fx":0,"col":[[R', G', B', W]]}]}
+```
+
+For RGB devices, a 3-element array is used:
+
+```json
+{"seg":[{"fx":0,"col":[[R, G, B]]}]}
+```
+
 ### Why Decompose at Color-Set Time?
 
-The decomposition is applied when the color is received from Zigbee, not when DMX output is generated. This means the `LightState` struct always holds the decomposed values. Benefits:
+The decomposition is applied when the color is received from Zigbee, not when WLED output is generated. This means the `LightState` struct always holds the decomposed values. Benefits:
 - The web UI `/api/lights/state` endpoint can report the white channel value directly
-- The DMX output code doesn't need to know about light types — it just outputs R, G, B, W from the state
+- The WLED output code doesn't need to know about light types — it just outputs R, G, B, W from the state
 - The live preview in the web UI can add W back into RGB for accurate color display
 
 ### Color Temperature and RGBW
@@ -369,10 +383,6 @@ Color temperature (CT) commands produce warm-to-cool whites that benefit signifi
 - **Cool white** (CT=153 mirek / 6500K) → RGB ≈ (255, 254, 250) → W=250, R'=5, G'=4, B'=0
 
 Cool whites are almost entirely handled by the white channel, which produces much cleaner output on RGBW fixtures than mixing R+G+B to approximate white.
-
-### Web UI Integration
-
-The `/api/lights/state` endpoint returns a `"w"` field for each light (0 for RGB lights, decomposed value for RGBW lights). The live preview JavaScript adds the white value back into the RGB display color so the preview matches the expected visual output of the fixture.
 
 ---
 
@@ -413,7 +423,7 @@ These guards ensure the coexistence code only compiles when the SDK is configure
 
 ### Performance Impact
 
-WiFi traffic can delay Zigbee responses. The ArtNet output was initially set to 40Hz but caused `ENOMEM` errors flooding the WiFi stack under 802.15.4 coexistence. Reduced to **2Hz (500ms interval)** which is reliable. Broadcast UDP packets were also unreliable under coexistence — solved by adding configurable unicast target IP.
+WiFi traffic can delay Zigbee responses. The WLED output rate is set to 2Hz (500ms interval) to avoid overwhelming the WiFi stack under 802.15.4 coexistence. HTTP requests to WLED devices use a 20-second timeout to tolerate the 1-2 second ping latency and 30-50% packet loss that occur during coexistence. The change-detection logic in `WledOutput::stateChanged()` ensures that HTTP requests are only sent when the light state actually differs from the last successfully sent state, minimizing unnecessary WiFi traffic.
 
 ---
 
@@ -527,81 +537,159 @@ The `#include "sdkconfig.h"` is **mandatory** before the `#if`. Without it, the 
 
 ---
 
-## ArtNet Protocol
+## WLED JSON API
 
-### Packet Format (OpDmx = 0x5000)
+### Overview
 
+WLED exposes a JSON-based HTTP API for controlling LED state. The bridge uses two endpoints:
+- **`/json/state`** (POST) — set the LED state (color, brightness, on/off, effect)
+- **`/json/info`** (GET) — query device metadata (name, LED count, RGBW capability, firmware version)
+
+Full API documentation: https://kno.wled.ge/interfaces/json-api/
+
+### State Control Payloads
+
+**Turn on with color (RGB):**
+```json
+{"on":true,"bri":128,"seg":[{"fx":0,"col":[[255,0,0]]}]}
 ```
-Offset  Size  Field              Notes
-------  ----  -----------------  --------------------------------
-0       8     Header             "Art-Net\0" (literal, NUL-terminated)
-8       2     Opcode             0x5000 (little-endian)
-10      2     Protocol Version   0x000e = 14 (big-endian)
-12      1     Sequence           1-255 incrementing, 0 = disabled
-13      1     Physical           Physical port (always 0 for us)
-14      2     Universe           0-32767 (little-endian, 15-bit)
-16      2     Data Length        2-512, must be even (big-endian)
-18      N     DMX Data           Channel 1 through Channel N
+
+**Turn on with color (RGBW):**
+```json
+{"on":true,"bri":255,"seg":[{"fx":0,"col":[[155,80,0,100]]}]}
 ```
 
-### Key Details
+**Turn off:**
+```json
+{"on":false}
+```
 
-- **Port:** UDP 6454 (both source and destination)
-- **Broadcast:** We send to 255.255.255.255 for simplicity. Art-Net spec allows directed broadcast (e.g., x.x.x.255) or unicast.
-- **Sequence:** We use incrementing 1-255 to allow receivers to detect packet reordering. 0 means "ignore sequence" per the spec.
-- **Data Length:** Always 512 in our implementation (full universe). Must be even per spec.
-- **Universe encoding:** The 15-bit universe field combines Net (bits 14-8), Sub-Net (bits 7-4), and Universe (bits 3-0). For simple use, the entire 15-bit value is the universe number.
-- **DMX Data:** Channels 1-512 in the packet correspond to `dmxData[1]` through `dmxData[512]` in our buffer. `dmxData[0]` (the DMX start code) is not transmitted in ArtNet.
-- **Frame rate:** We send at ~2Hz (500ms interval) to avoid ENOMEM errors under WiFi/802.15.4 coexistence. Art-Net receivers typically expect 1-44Hz.
+### Key Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `on` | bool | Power state |
+| `bri` | uint8 | Master brightness (0-255) |
+| `seg` | array | Segment array — we always target segment 0 |
+| `seg[0].fx` | uint8 | Effect ID — 0 = "Solid" (overrides any active animation) |
+| `seg[0].col` | array | Color slots — `col[0]` is the primary color |
+| `seg[0].col[0]` | array | RGB `[R,G,B]` or RGBW `[R,G,B,W]` values (0-255 each) |
+
+### Why fx:0 is Required
+
+WLED devices may have an active effect (e.g., rainbow, breathing, etc.) from manual or app-based control. Setting `fx:0` forces the "Solid" effect, ensuring the bridge's color command takes immediate visual effect. Without this, the color values might be ignored or modulated by the running effect.
+
+### Brightness Mapping
+
+Zigbee level control uses 0-254 range. WLED uses 0-255. The mapping in `src/wled_output.cpp`:
+
+```cpp
+uint8_t wledBri = (state.brightness >= 254) ? 255
+                : static_cast<uint8_t>(state.brightness + (state.brightness > 0 ? 1 : 0));
+```
+
+This maps: 0→0, 1→2, 2→3, ..., 253→254, 254→255. The +1 offset avoids the Zigbee value 1 mapping to WLED value 1 (which is extremely dim and indistinguishable from off on most LED strips).
+
+### /json/info Response Format
+
+The discovery process queries `/json/info` to get device metadata:
+
+```json
+{
+  "ver": "0.14.0",
+  "name": "WLED-Living-Room",
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "leds": {
+    "count": 60,
+    "rgbw": true,
+    "wv": true
+  }
+}
+```
+
+Relevant fields used by discovery:
+- `name` — display name shown in the web UI discovery panel
+- `mac` — used for device identification
+- `ver` — firmware version, displayed in the UI
+- `leds.count` — number of LEDs, shown in the discovery card
+- `leds.rgbw` — whether the device supports RGBW (determines 3 or 4 element color array)
+
+### HTTP Configuration
+
+```cpp
+static const int HTTP_TIMEOUT_MS = 20000;  // 20 second timeout
+```
+
+The generous timeout accounts for WiFi/Zigbee coexistence delays. Under coexistence, WiFi round-trip times of 1-2 seconds are typical, with occasional spikes much higher. The `HTTPClient` library from the Arduino ESP32 framework handles connection pooling automatically — no additional `lib_deps` entry is needed in `platformio.ini`.
+
+### Change Detection
+
+The `WledOutput` class tracks the last successfully sent state per light in a `SentState` struct:
+
+```cpp
+struct SentState {
+    bool valid;       // has any state been sent?
+    bool powerOn;
+    uint8_t brightness;
+    uint8_t red, green, blue, white;
+};
+```
+
+Before sending, `stateChanged()` compares the current light state against the last-sent state. If nothing changed, the HTTP request is skipped entirely. On send failure, the `valid` flag is cleared so the next cycle retries.
+
+### Error Tracking
+
+Consecutive send failures are tracked per device. Error logging uses a power-of-2 strategy (`(errors & (errors - 1)) == 0`) to avoid flooding the serial console — errors are logged at 1, 2, 4, 8, 16, 32, ... consecutive failures. When a device recovers, a recovery message is logged with the error count.
 
 ---
 
-## DMX512 Protocol
+## WLED Device Discovery
 
-### Signal Format
+### mDNS Scanning
 
-- **BREAK:** >= 88us of continuous LOW (mark space). We generate this by sending a 0x00 byte at 90909 baud, which produces a ~110us low signal.
-- **MAB (Mark After Break):** >= 8us HIGH. Generated automatically by the UART idle line between the BREAK byte and the start of data.
-- **Data:** 250000 baud, 8 data bits, no parity, 2 stop bits (8N2). Start code (0x00) followed by up to 512 channel bytes.
+WLED devices advertise themselves as `_http._tcp` mDNS services. The discovery process in `src/wled_discovery.cpp`:
 
-### UART Configuration
+1. Initialize mDNS with hostname `zigbeewled` (retries once on failure)
+2. Query for `_http._tcp` services using `MDNS.queryService("http", "tcp")`
+3. Filter results by hostname — only devices with hostnames starting with `wled` (case-insensitive) are probed
+4. For each candidate, query `http://<ip>:<port>/json/info` via HTTP GET
+5. Parse the JSON response to extract device metadata
+6. Return the list of discovered `WledDeviceInfo` structs
 
-```cpp
-uart_config.baud_rate = 250000;
-uart_config.data_bits = UART_DATA_8_BITS;
-uart_config.parity    = UART_PARITY_DISABLE;
-uart_config.stop_bits = UART_STOP_BITS_2;
+### ESP32 mDNS API Notes
+
+The ESP32 Arduino mDNS library has a different API from some other Arduino mDNS implementations:
+- Use `MDNS.address(i)` to get the IP address (not `MDNS.IP(i)` — this was a build error we encountered)
+- `MDNS.hostname(i)` returns the hostname
+- `MDNS.port(i)` returns the port number
+
+### Hostname Filtering
+
+The discovery only probes devices whose mDNS hostname starts with `wled`. This is a performance optimization — without filtering, every HTTP service on the network would receive an HTTP GET request, which is slow under coexistence conditions (10-second timeout per device). WLED devices use default hostnames like `wled-AABBCC` (based on MAC address). Devices with custom hostnames that don't start with `wled` will not be discovered.
+
+### Discovery Timeout
+
+The mDNS query itself is fast (~2 seconds), but probing each discovered device via HTTP is slow under coexistence. With a 10-second per-device timeout, scanning a network with many HTTP services could take a long time. The hostname filter reduces this to only WLED devices.
+
+### Web UI Integration
+
+The discovery endpoint `/api/wled/discover` is called when the user clicks "Scan" in the web UI. The response is a JSON array of discovered devices:
+
+```json
+[
+  {
+    "name": "WLED-Living-Room",
+    "host": "192.168.1.50",
+    "port": 80,
+    "mac": "AA:BB:CC:DD:EE:FF",
+    "version": "0.14.0",
+    "ledCount": 60,
+    "isRGBW": true
+  }
+]
 ```
 
-We use UART1 (`UART_NUM_1`). UART0 is reserved for the USB serial console on ESP32-C6.
-
-### Break Generation
-
-Rather than using GPIO bit-banging or the UART break feature (which doesn't work reliably on all ESP32 variants), we temporarily switch to a lower baud rate:
-
-```cpp
-uart_set_baudrate(DMX_UART, 90909);  // ~110us per byte = valid BREAK
-uart_write_bytes(DMX_UART, &breakByte, 1);
-uart_wait_tx_done(DMX_UART, pdMS_TO_TICKS(100));
-uart_set_baudrate(DMX_UART, 250000);  // restore
-```
-
-### RS-485 Enable Pin
-
-The transceiver enable pin (e.g., MAX485 DE/RE) is held HIGH for the entire transmission window. We don't toggle it per-byte because the DMX output is continuous.
-
-### Channel Mapping
-
-Each light has a configurable DMX start address (1-512) and per-channel offsets:
-
-```
-DMX address = start_addr + channel_map.red    -> Red channel
-DMX address = start_addr + channel_map.green  -> Green channel
-DMX address = start_addr + channel_map.blue   -> Blue channel
-DMX address = start_addr + channel_map.white  -> White channel (RGBW only)
-```
-
-Default mapping: R=+0, G=+1, B=+2, W=+3. This matches common RGB/RGBW fixtures but can be rearranged for fixtures with non-standard channel orders (e.g., GRBW or BRGW).
+Each device is shown as a selectable card in the UI. Clicking a device populates the light configuration form with the device's IP and port.
 
 ---
 
@@ -624,21 +712,32 @@ This provides:
 
 ESPAsyncWebServer + AsyncTCP is incompatible with the ESP32-C6 USB serial configuration. The C6 uses a hardware UART over USB (not USB CDC like the S3), and `ARDUINO_USB_CDC_ON_BOOT=1` causes compilation failures in AsyncTCP. We use the built-in synchronous `WebServer` library instead.
 
-### esp_dmx Library
-
-The `esp_dmx` library v4.1.0 is incompatible with ESP-IDF v5.5.x due to the removal of `uart_periph_signal[].module`. A fix exists in PR #223 (fork: `https://github.com/joseluu/esp_dmx` branch `fix/idf-v5-uart-periph-module`). However, we opted for raw UART-based DMX output instead, which is simpler and avoids the dependency entirely.
-
 ### ArduinoJson v7
 
 ArduinoJson v7.4.3 changed the `is<JsonArray>()` API. `doc["lights"].is<JsonArray>()` returns false even when the key contains an array. The fix is to use `doc["lights"].as<JsonArrayConst>()` and check `.isNull()` instead.
 
+### HTTPClient Library
+
+The Arduino ESP32 framework includes `HTTPClient` out of the box — no `lib_deps` entry is needed. This was discovered during the zigbee_wled transformation. The library provides:
+- Connection timeout and read timeout configuration
+- HTTP POST with custom headers (Content-Type: application/json)
+- Automatic connection handling (no keep-alive pool management needed)
+
+### ESP32 mDNS Library
+
+The `ESPmDNS` library is also built into the Arduino ESP32 framework. Key discovery: the IP accessor method is `MDNS.address(i)`, not `MDNS.IP(i)` — this caused a build error during initial development.
+
+### Build Size
+
+The WLED variant builds successfully on the 4MB partition layout:
+- **RAM usage:** 20.1%
+- **Flash usage:** 90.9%
+
+Flash is near capacity. Adding significant new features may require switching to the 8MB flash variant or optimizing the web UI HTML (which is compiled into the binary as string literals).
+
 ---
 
 ## Runtime Bugs Found and Fixed
-
-### UART RX Buffer Size
-
-ESP-IDF v5 requires the UART RX buffer to be >= `SOC_UART_FIFO_LEN` (128 bytes on ESP32-C6). Passing 0 for RX-only usage causes `uart_driver_install` to fail. Fixed by setting RX buffer to 256.
 
 ### NVS First-Boot Failure
 
@@ -652,6 +751,10 @@ The `ARDUINO_USB_CDC_ON_BOOT=1` build flag is incorrect for ESP32-C6. The C6 use
 
 The preprocessor guard `#if defined(CONFIG_IDF_TARGET_ESP32C6)` must appear **after** `#include "sdkconfig.h"`. Without the include, the macro is undefined and the entire Zigbee implementation is silently excluded from compilation.
 
+### ESP32 mDNS API Mismatch
+
+The initial code used `MDNS.IP(i)` to retrieve discovered device IP addresses, based on other Arduino mDNS library documentation. The ESP32 Arduino `ESPmDNS` library uses `MDNS.address(i)` instead. This caused a compilation error that was fixed during the zigbee_wled build.
+
 ---
 
 ## Reference Implementation
@@ -659,18 +762,21 @@ The preprocessor guard `#if defined(CONFIG_IDF_TARGET_ESP32C6)` must appear **af
 This project is adapted from the WLED Zigbee RGB Light usermod:
 - **Repository:** https://github.com/netmindz/WLED-MM/tree/zigbee-rgb-light-usermod/usermods/zigbee_rgb_light/
 - **Key files:** `usermod_zigbee_rgb_light.h` (single file, ~800 lines)
-- **Differences:** The usermod runs inside WLED and controls LED strips. This project is standalone and outputs DMX/ArtNet.
+- **Differences:** The usermod runs inside WLED and controls LED strips directly. This project is standalone — it acts as a Zigbee-to-HTTP bridge, receiving Zigbee commands from the Hue Bridge and forwarding them to external WLED devices over the network.
 - **All Hue-specific workarounds** in this project originated from that usermod and were proven through months of testing with a Hue Bridge V2.
 
-### Tested Hue Bridge Configuration
+### Relationship to zigbee_dmx
 
-- **Device EUI64:** `40:4C:CA:FF:FE:57:2A:08`
-- **Bridge IP:** `192.168.178.216`
-- **Zigbee Channel:** 25
-- **Device WiFi IP:** `192.168.178.110` on "MilliWatt" network
-- **Light IDs on bridge:** #26 (endpoint 10, RGB) and #27 (endpoint 20, RGBW)
-- **Metadata:** manufacturer "ZigbeeDMX", model "Test Light 1"/"Test Light 2", type "Extended color light", reachable=true
-- **Integration test:** 178/180 pass (2 transient timing failures on CT propagation)
+This project is a fork of [zigbee_dmx](https://github.com/netmindz/zigbee_dmx). The shared code includes:
+- Zigbee stack initialization and Hue pairing logic (`zigbee_manager.cpp`)
+- CIE XY and HSV color conversion
+- RGBW white channel decomposition
+- Web UI framework (WiFi setup, captive portal, REST API structure)
+- Configuration persistence via NVS
+
+The output stage was replaced: DMX512/ArtNet UART and UDP output → HTTP POST to WLED JSON API. The configuration model was simplified: DMX address + channel map → WLED host + port. A new mDNS discovery system was added.
+
+The `upstream` remote in the git repo points to the local zigbee_dmx repository for cherry-picking shared fixes (e.g., Zigbee stack improvements, color conversion bug fixes).
 
 ---
 
@@ -695,11 +801,14 @@ All issues at: https://github.com/espressif/esp-zigbee-sdk/issues/
 ### High Priority
 
 - **Zigbee state reporting** — implement `zigbeeReportState()` to send attribute reports back to the coordinator when state changes from the web UI
+- **WLED state sync** — periodically query WLED `/json/state` to detect out-of-band changes (e.g., user controlling WLED via its own app) and report them back to Hue
 
 ### Medium Priority
 
-- **mDNS/service discovery** — advertise the web UI via mDNS so it's discoverable without knowing the IP
-- **Web UI improvements** — output mode change should trigger immediate reconfigure without requiring manual restart
+- **mDNS service advertisement** — advertise the bridge's web UI via mDNS so it's discoverable without knowing the IP
+- **Web UI improvements** — light count change should trigger immediate Zigbee reconfigure without requiring manual restart
+- **WLED segments** — support targeting specific WLED segments instead of always controlling segment 0, allowing one WLED device to present multiple Zigbee lights for different strip sections
+- **Transition animations** — send WLED's native transition duration parameter instead of interpolating in firmware
 
 ### Low Priority
 
@@ -707,5 +816,5 @@ All issues at: https://github.com/espressif/esp-zigbee-sdk/issues/
 - **deCONZ DDF file** — write a device description file for deCONZ/Phoscon
 - **Scene support** — implement ZCL scene storage so Hue scenes work properly
 - **Power-on behavior** — configure what happens when the device powers on (restore last state, default white, etc.)
-- **Rate limiting** — ArtNet output rate is currently fixed at 2Hz. Some receivers may prefer higher rates. Make configurable (with coexistence-aware upper bound).
-- **ESP-DMX library integration** — use the esp_dmx library (with PR #223 fix) for more robust DMX timing instead of raw UART baud-rate switching
+- **WLED presets** — support triggering WLED presets from Zigbee scenes
+- **WLED websocket API** — use WLED's websocket interface instead of HTTP POST for lower latency and bidirectional state sync
