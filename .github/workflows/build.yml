@@ -112,7 +112,7 @@ jobs:
 
           cat > site/manifest.json << MANIFEST
           {
-            "name": "Zigbee DMX Bridge",
+            "name": "Zigbee WLED Bridge",
             "version": "${{ steps.version.outputs.version }}",
             "new_install_prompt_erase": true,
             "builds": [

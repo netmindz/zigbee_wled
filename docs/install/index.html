@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Zigbee DMX Bridge — Install</title>
+  <title>Zigbee WLED Bridge — Install</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231a1a2e'/%3E%3Cpath d='M18 4L8 18h6l-2 10 10-14h-6z' fill='%2300d4ff'/%3E%3C/svg%3E">
   <script
     type="module"
@@ -136,8 +136,8 @@
 </head>
 <body>
   <div class="container">
-    <h1>⚡ Zigbee DMX Bridge</h1>
-    <p class="subtitle">ESP32-C6 Zigbee → DMX512 / ArtNet bridge</p>
+    <h1>⚡ Zigbee WLED Bridge</h1>
+    <p class="subtitle">ESP32-C6 Zigbee → WLED bridge</p>
 
     <div class="browser-warning" id="browser-warning">
       ⚠️ Web Serial is not supported in this browser.<br />
@@ -151,7 +151,7 @@
           Connect your ESP32-C6 via USB, then click the button below.
         </p>
         <esp-web-install-button manifest="manifest.json">
-          <button slot="activate">Install Zigbee DMX Bridge</button>
+          <button slot="activate">Install Zigbee WLED Bridge</button>
           <span slot="unsupported">
             Your browser does not support Web Serial.<br />
             Use Chrome or Edge on desktop.
@@ -171,9 +171,9 @@
     <div class="card">
       <h2>What you get</h2>
       <ul class="features">
-        <li>Hue-compatible Zigbee endpoints — each light appears in the Hue app</li>
-        <li>Wired DMX512 or ArtNet output, selectable from the web UI</li>
-        <li>Up to 16 RGB / RGBW lights with per-light DMX address mapping</li>
+        <li>Hue-compatible Zigbee endpoints — each WLED device appears in the Hue app</li>
+        <li>mDNS discovery finds WLED devices on your network automatically</li>
+        <li>Up to 16 RGB / RGBW WLED lights controlled via the WLED JSON API</li>
         <li>Web configuration UI with captive portal for WiFi setup</li>
         <li>CIE XY, Hue/Sat, and Color Temperature support</li>
       </ul>
@@ -182,17 +182,17 @@
     <div class="card">
       <h2>After flashing</h2>
       <ol style="padding-left: 1.25rem; display: grid; gap: 0.5rem;">
-        <li>Connect to the <strong>ZigbeeDMX-Setup</strong> WiFi network</li>
+        <li>Connect to the <strong>ZigbeeWLED-Setup</strong> WiFi network</li>
         <li>Configure your home WiFi in the captive portal</li>
-        <li>Open the device's IP in a browser to configure lights &amp; output</li>
+        <li>Open the device's IP in a browser to discover and add WLED devices</li>
         <li>Pair with your Hue Bridge via <em>Settings → Lights → Search</em></li>
       </ol>
     </div>
   </div>
 
   <footer>
-    <a href="https://github.com/netmindz/zigbee_dmx">GitHub</a> ·
-    View the <a href="https://github.com/netmindz/zigbee_dmx/releases">release notes</a>
+    <a href="https://github.com/netmindz/zigbee_wled">GitHub</a> ·
+    View the <a href="https://github.com/netmindz/zigbee_wled/releases">release notes</a>
   </footer>
 
   <script>
