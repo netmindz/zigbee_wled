@@ -518,13 +518,20 @@ function uploadOTA() {
   xhr.send(formData);
 }
 
-// Initial load - fetch both in parallel
+// Poll helpers: wait for request to finish before scheduling next
+function pollStatus() {
+  loadStatus().finally(() => setTimeout(pollStatus, 5000));
+}
+function pollLightStates() {
+  loadLightStates().finally(() => setTimeout(pollLightStates, 1000));
+}
+
+// Initial load - fetch both in parallel, then start polling
 Promise.all([loadStatus(), loadConfig()]).then(() => {
   document.getElementById('loadingState')?.remove();
+  setTimeout(pollStatus, 5000);
+  setTimeout(pollLightStates, 1000);
 });
-// Refresh status every 5s, light previews every 1s
-setInterval(loadStatus, 5000);
-setInterval(loadLightStates, 1000);
 </script>
 </body>
 </html>

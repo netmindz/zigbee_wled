@@ -201,6 +201,20 @@ class ArtNetListener:
             time.sleep(0.05)
         return False
 
+    def wait_for_fresh_data(self, timeout: float = 5.0) -> Optional[bytearray]:
+        """Clear old data, wait for a new packet, and return the DMX data."""
+        with self._lock:
+            self.last_dmx_data = None
+            self.last_packet = None
+            initial_count = self.packet_count
+        start = time.time()
+        while time.time() - start < timeout:
+            with self._lock:
+                if self.packet_count > initial_count and self.last_dmx_data is not None:
+                    return bytearray(self.last_dmx_data)
+            time.sleep(0.05)
+        return None
+
     def clear(self):
         """Clear the last received data (useful before a new test)."""
         with self._lock:
@@ -261,7 +275,14 @@ class HueAPI:
         r = requests.put(f"{self.base_url}{path}", json=data,
                          verify=False, timeout=10)
         r.raise_for_status()
-        return r.json()
+        result = r.json()
+        # Check for Hue API errors in the response
+        if isinstance(result, list):
+            for item in result:
+                if "error" in item:
+                    desc = item["error"].get("description", "unknown error")
+                    print(f"    WARNING: Hue API error: {desc}")
+        return result
 
     def get_lights(self) -> dict:
         return self._get("/lights")
@@ -382,6 +403,24 @@ def zcl_xy_to_hue(zcl_x: int, zcl_y: int) -> tuple:
 #  Test helpers
 # ---------------------------------------------------------------------------
 
+def read_dmx_rgb(listener: ArtNetListener, dmx_start: int,
+                 channel_map: dict, settle_time: float) -> Optional[tuple]:
+    """
+    Wait for a fresh ArtNet packet and extract the RGB DMX values.
+    Returns (dmx_r, dmx_g, dmx_b) or None if no packet received.
+    """
+    dmx = listener.wait_for_fresh_data(timeout=settle_time + 2.0)
+    if dmx is None:
+        return None
+    r_ch = dmx_start + channel_map.get("r", 0) - 1  # 0-indexed
+    g_ch = dmx_start + channel_map.get("g", 1) - 1
+    b_ch = dmx_start + channel_map.get("b", 2) - 1
+    dmx_r = dmx[r_ch] if r_ch < len(dmx) else 0
+    dmx_g = dmx[g_ch] if g_ch < len(dmx) else 0
+    dmx_b = dmx[b_ch] if b_ch < len(dmx) else 0
+    return (dmx_r, dmx_g, dmx_b)
+
+
 def find_device_lights(api: HueAPI, device_eui64: Optional[str] = None,
                        manufacturer: str = DEVICE_MANUFACTURER) -> dict:
     """
@@ -479,17 +518,11 @@ def test_light_on_off(api: HueAPI, light_id: str, listener: Optional[ArtNetListe
                   True, state.get("on"))
 
     if listener:
-        dmx = listener.get_dmx_data()
-        if dmx is None:
+        rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
+        if rgb is None:
             results.check(f"Light {light_id} ON: ArtNet packet received", True, False)
         else:
-            # White should produce roughly equal RGB at full brightness
-            r_ch = dmx_start + channel_map.get("r", 0) - 1  # 0-indexed
-            g_ch = dmx_start + channel_map.get("g", 1) - 1
-            b_ch = dmx_start + channel_map.get("b", 2) - 1
-            dmx_r = dmx[r_ch] if r_ch < len(dmx) else 0
-            dmx_g = dmx[g_ch] if g_ch < len(dmx) else 0
-            dmx_b = dmx[b_ch] if b_ch < len(dmx) else 0
+            dmx_r, dmx_g, dmx_b = rgb
             print(f"  ArtNet DMX values: R={dmx_r} G={dmx_g} B={dmx_b}")
             # White at full brightness should have high values on all channels
             results.check(f"Light {light_id} ON: DMX R > 200", True, dmx_r > 200)
@@ -506,14 +539,11 @@ def test_light_on_off(api: HueAPI, light_id: str, listener: Optional[ArtNetListe
                   False, state.get("on"))
 
     if listener:
-        dmx = listener.get_dmx_data()
-        if dmx is not None:
-            r_ch = dmx_start + channel_map.get("r", 0) - 1
-            g_ch = dmx_start + channel_map.get("g", 1) - 1
-            b_ch = dmx_start + channel_map.get("b", 2) - 1
-            dmx_r = dmx[r_ch] if r_ch < len(dmx) else 0
-            dmx_g = dmx[g_ch] if g_ch < len(dmx) else 0
-            dmx_b = dmx[b_ch] if b_ch < len(dmx) else 0
+        rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
+        if rgb is None:
+            results.check(f"Light {light_id} OFF: ArtNet packet received", True, False)
+        else:
+            dmx_r, dmx_g, dmx_b = rgb
             print(f"  ArtNet DMX values: R={dmx_r} G={dmx_g} B={dmx_b}")
             results.check(f"Light {light_id} OFF: DMX R == 0", 0, dmx_r)
             results.check(f"Light {light_id} OFF: DMX G == 0", 0, dmx_g)
@@ -552,18 +582,13 @@ def test_light_color(api: HueAPI, light_id: str, listener: Optional[ArtNetListen
                       xy[1], reported_xy[1], tolerance=0.05)
 
         if listener:
-            dmx = listener.get_dmx_data()
-            if dmx is None:
+            rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
+            if rgb is None:
                 results.check(f"Light {light_id} {color_name}: ArtNet received",
                               True, False)
                 continue
 
-            r_ch = dmx_start + channel_map.get("r", 0) - 1
-            g_ch = dmx_start + channel_map.get("g", 1) - 1
-            b_ch = dmx_start + channel_map.get("b", 2) - 1
-            dmx_r = dmx[r_ch] if r_ch < len(dmx) else 0
-            dmx_g = dmx[g_ch] if g_ch < len(dmx) else 0
-            dmx_b = dmx[b_ch] if b_ch < len(dmx) else 0
+            dmx_r, dmx_g, dmx_b = rgb
             print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b}")
 
             # The dominant channel should be the highest
@@ -600,18 +625,13 @@ def test_light_brightness(api: HueAPI, light_id: str, listener: Optional[ArtNetL
                       bri, reported_bri, tolerance=1)
 
         if listener:
-            dmx = listener.get_dmx_data()
-            if dmx is None:
+            rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
+            if rgb is None:
                 results.check(f"Light {light_id} bri={bri}: ArtNet received",
                               True, False)
                 continue
 
-            r_ch = dmx_start + channel_map.get("r", 0) - 1
-            g_ch = dmx_start + channel_map.get("g", 1) - 1
-            b_ch = dmx_start + channel_map.get("b", 2) - 1
-            dmx_r = dmx[r_ch] if r_ch < len(dmx) else 0
-            dmx_g = dmx[g_ch] if g_ch < len(dmx) else 0
-            dmx_b = dmx[b_ch] if b_ch < len(dmx) else 0
+            dmx_r, dmx_g, dmx_b = rgb
             print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b}")
 
             # For white, all channels should be roughly equal
@@ -658,17 +678,12 @@ def test_light_color_accuracy(api: HueAPI, light_id: str,
         if not listener:
             continue
 
-        dmx = listener.get_dmx_data()
-        if dmx is None:
+        rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
+        if rgb is None:
             results.check(f"Light {light_id} {name}: ArtNet received", True, False)
             continue
 
-        r_ch = dmx_start + channel_map.get("r", 0) - 1
-        g_ch = dmx_start + channel_map.get("g", 1) - 1
-        b_ch = dmx_start + channel_map.get("b", 2) - 1
-        dmx_r = dmx[r_ch] if r_ch < len(dmx) else 0
-        dmx_g = dmx[g_ch] if g_ch < len(dmx) else 0
-        dmx_b = dmx[b_ch] if b_ch < len(dmx) else 0
+        dmx_r, dmx_g, dmx_b = rgb
 
         # Compute expected RGB using our Python port of the firmware's algo
         exp_r, exp_g, exp_b = cie_xy_to_rgb(xy[0], xy[1])
@@ -750,6 +765,21 @@ def test_light_color_temperature(api: HueAPI, light_id: str,
     """
     print(f"\n--- Test: COLOR TEMPERATURE for light #{light_id} ---")
 
+    # Check if the bridge thinks this light supports color temperature
+    light_info = api.get_light(light_id)
+    light_type = light_info.get("type", "")
+    capabilities = light_info.get("capabilities", {})
+    ct_cap = capabilities.get("control", {}).get("ct")
+
+    if light_type == "Color light" or ct_cap is None:
+        print(f"  SKIP: Bridge reports type='{light_type}' with no CT capability.")
+        print(f"  The device needs to be re-paired for the bridge to discover")
+        print(f"  the updated color temperature attributes.")
+        print(f"  Steps: Delete light #{light_id} from bridge -> re-pair device")
+        results.check(f"Light {light_id} CT: bridge reports CT capability",
+                      True, False)
+        return
+
     api.set_light_state(light_id, {"on": True, "bri": 254})
     time.sleep(0.5)
 
@@ -764,28 +794,42 @@ def test_light_color_temperature(api: HueAPI, light_id: str,
     for name, mirek, desc in test_cases:
         print(f"  Setting CT={mirek} mirek ({desc})...")
         response = api.set_light_state(light_id, {"ct": mirek})
+
+        # Check if the Hue API reported an error (e.g. parameter not available)
+        has_error = False
+        if isinstance(response, list):
+            for item in response:
+                if "error" in item:
+                    has_error = True
+                    break
+        if has_error:
+            results.check(f"Light {light_id} CT {name}: Hue API accepted ct parameter",
+                          True, False)
+            continue
+
         time.sleep(settle_time)
 
         # Verify Hue reports the color temperature
         state = api.get_light(light_id).get("state", {})
-        reported_ct = state.get("ct", 0)
+        reported_ct = state.get("ct")
+        if reported_ct is None or reported_ct == 0:
+            print(f"    WARNING: Bridge reports ct={reported_ct} - CT not supported?")
+            results.check(f"Light {light_id} CT {name}: Hue reports ct ~= {mirek}",
+                          mirek, reported_ct or 0, tolerance=5)
+            continue
+
         results.check(f"Light {light_id} CT {name}: Hue reports ct ~= {mirek}",
                       mirek, reported_ct, tolerance=5)
 
         if not listener:
             continue
 
-        dmx = listener.get_dmx_data()
-        if dmx is None:
+        rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
+        if rgb is None:
             results.check(f"Light {light_id} CT {name}: ArtNet received", True, False)
             continue
 
-        r_ch = dmx_start + channel_map.get("r", 0) - 1
-        g_ch = dmx_start + channel_map.get("g", 1) - 1
-        b_ch = dmx_start + channel_map.get("b", 2) - 1
-        dmx_r = dmx[r_ch] if r_ch < len(dmx) else 0
-        dmx_g = dmx[g_ch] if g_ch < len(dmx) else 0
-        dmx_b = dmx[b_ch] if b_ch < len(dmx) else 0
+        dmx_r, dmx_g, dmx_b = rgb
 
         # Compute expected RGB from our Python port of the firmware
         exp_r, exp_g, exp_b = mirek_to_rgb(mirek)
@@ -949,9 +993,14 @@ def main():
             if listener.wait_for_packet(timeout=10):
                 print(f"  Received ArtNet from {listener.last_source_ip}")
             else:
-                print("  WARNING: No ArtNet packets received within 10s.")
-                print("  Is the device configured for ArtNet output?")
-                print("  Continuing tests (ArtNet checks will fail).")
+                print("  ERROR: No ArtNet packets received within 10s.",
+                      file=sys.stderr)
+                print("  Is the device configured for ArtNet output?",
+                      file=sys.stderr)
+                print("  Use --skip-artnet to run without ArtNet verification.",
+                      file=sys.stderr)
+                listener.stop()
+                sys.exit(1)
 
     # --- Run tests ---
     results = TestResult()
