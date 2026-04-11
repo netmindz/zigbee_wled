@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Zigbee DMX Bridge — Install</title>
+  <script
+    type="module"
+    src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"
+  ></script>
+  <style>
+    :root {
+      --accent: #1a73e8;
+      --bg: #fafafa;
+      --card: #ffffff;
+      --text: #202124;
+      --muted: #5f6368;
+      --border: #dadce0;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --accent: #8ab4f8;
+        --bg: #1e1e1e;
+        --card: #2d2d2d;
+        --text: #e8eaed;
+        --muted: #9aa0a6;
+        --border: #3c4043;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+    .container {
+      max-width: 640px;
+      width: 100%;
+    }
+    h1 {
+      font-size: 2rem;
+      margin-bottom: 0.25rem;
+    }
+    .subtitle {
+      color: var(--muted);
+      margin-bottom: 2rem;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 2rem;
+      margin-bottom: 1.5rem;
+    }
+    .card h2 {
+      font-size: 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .install-box {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 1rem;
+    }
+    esp-web-install-button {
+      --esp-tools-button-color: var(--accent);
+    }
+    esp-web-install-button button {
+      font-size: 1.1rem;
+      padding: 0.75rem 2rem;
+      border: none;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+      font-weight: 500;
+      transition: opacity 0.2s;
+    }
+    esp-web-install-button button:hover {
+      opacity: 0.85;
+    }
+    .note {
+      font-size: 0.85rem;
+      color: var(--muted);
+      text-align: center;
+    }
+    .features {
+      list-style: none;
+      display: grid;
+      gap: 0.75rem;
+    }
+    .features li {
+      padding-left: 1.5rem;
+      position: relative;
+    }
+    .features li::before {
+      content: "✓";
+      position: absolute;
+      left: 0;
+      color: var(--accent);
+      font-weight: bold;
+    }
+    footer {
+      margin-top: auto;
+      padding-top: 2rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+    footer a { color: var(--accent); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    .browser-warning {
+      display: none;
+      background: #fff3cd;
+      color: #856404;
+      border: 1px solid #ffc107;
+      border-radius: 8px;
+      padding: 1rem;
+      margin-bottom: 1.5rem;
+      text-align: center;
+    }
+    @media (prefers-color-scheme: dark) {
+      .browser-warning {
+        background: #332b00;
+        color: #ffc107;
+        border-color: #665500;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>⚡ Zigbee DMX Bridge</h1>
+    <p class="subtitle">ESP32-C6 Zigbee → DMX512 / ArtNet bridge</p>
+
+    <div class="browser-warning" id="browser-warning">
+      ⚠️ Web Serial is not supported in this browser.<br />
+      Please use <strong>Google Chrome</strong> or <strong>Microsoft Edge</strong> on desktop.
+    </div>
+
+    <div class="card">
+      <div class="install-box">
+        <h2>Install Firmware</h2>
+        <p class="note">
+          Connect your ESP32-C6 via USB, then click the button below.
+        </p>
+        <esp-web-install-button manifest="manifest.json">
+          <button slot="activate">Install Zigbee DMX Bridge</button>
+          <span slot="unsupported">
+            Your browser does not support Web Serial.<br />
+            Use Chrome or Edge on desktop.
+          </span>
+          <span slot="not-allowed">
+            Serial access was denied.<br />
+            Make sure no other program is using the port.
+          </span>
+        </esp-web-install-button>
+        <p class="note">
+          First-time install will erase the device.<br />
+          Updates preserve your configuration.
+        </p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>What you get</h2>
+      <ul class="features">
+        <li>Hue-compatible Zigbee endpoints — each light appears in the Hue app</li>
+        <li>Wired DMX512 or ArtNet output, selectable from the web UI</li>
+        <li>Up to 16 RGB / RGBW lights with per-light DMX address mapping</li>
+        <li>Web configuration UI with captive portal for WiFi setup</li>
+        <li>CIE XY, Hue/Sat, and Color Temperature support</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>After flashing</h2>
+      <ol style="padding-left: 1.25rem; display: grid; gap: 0.5rem;">
+        <li>Connect to the <strong>ZigbeeDMX-Setup</strong> WiFi network</li>
+        <li>Configure your home WiFi in the captive portal</li>
+        <li>Open the device's IP in a browser to configure lights &amp; output</li>
+        <li>Pair with your Hue Bridge via <em>Settings → Lights → Search</em></li>
+      </ol>
+    </div>
+  </div>
+
+  <footer>
+    <a href="https://github.com/netmindz/zigbee_dmx">GitHub</a> ·
+    View the <a href="https://github.com/netmindz/zigbee_dmx/releases">release notes</a>
+  </footer>
+
+  <script>
+    if (!("serial" in navigator)) {
+      document.getElementById("browser-warning").style.display = "block";
+    }
+  </script>
+</body>
+</html>
+

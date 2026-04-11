@@ -12,6 +12,7 @@ Hue Bridge  ──(Zigbee ZCL)──>  ESP32-C6  ──(DMX512 / ArtNet)──> 
 
 ## Features
 
+- **Browser-based installer** — flash directly from [netmindz.github.io/zigbee_dmx](https://netmindz.github.io/zigbee_dmx/) using ESP Web Tools (Chrome/Edge, no build tools needed)
 - **Hue-compatible Zigbee endpoints** — each configured light appears as a separate Extended Color Light (device ID 0x010D) on the Philips Hue Bridge, with full multi-endpoint discovery support
 - **Dual output modes** — wired DMX512 via RS-485 transceiver, or ArtNet (Art-Net DMX over UDP unicast/broadcast), selectable from the web UI
 - **Up to 16 RGB/RGBW lights** — each with configurable DMX start address and channel-to-offset mapping

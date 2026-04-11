@@ -1,0 +1,147 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio
+          key: pio-${{ hashFiles('platformio.ini') }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        run: pio run -e esp32c6
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p release
+          cp .pio/build/esp32c6/bootloader.bin    release/
+          cp .pio/build/esp32c6/partitions.bin     release/
+          cp .pio/build/esp32c6/firmware.bin        release/
+          # boot_app0.bin initialises the OTA data partition
+          if [ -f .pio/build/esp32c6/boot_app0.bin ]; then
+            cp .pio/build/esp32c6/boot_app0.bin release/
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: release/
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+
+  deploy-pages:
+    needs: build
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: firmware
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build pages site
+        run: |
+          mkdir -p site
+
+          # Copy firmware binaries
+          cp firmware/bootloader.bin site/
+          cp firmware/partitions.bin site/
+          cp firmware/firmware.bin   site/
+          if [ -f firmware/boot_app0.bin ]; then
+            cp firmware/boot_app0.bin site/
+          fi
+
+          # Generate manifest.json
+          BOOT_APP0_PART=""
+          if [ -f firmware/boot_app0.bin ]; then
+            BOOT_APP0_PART='{"path": "boot_app0.bin", "offset": 57344},'
+          fi
+
+          cat > site/manifest.json << MANIFEST
+          {
+            "name": "Zigbee DMX Bridge",
+            "version": "${{ steps.version.outputs.version }}",
+            "new_install_prompt_erase": true,
+            "builds": [
+              {
+                "chipFamily": "ESP32-C6",
+                "parts": [
+                  { "path": "bootloader.bin", "offset": 0 },
+                  { "path": "partitions.bin", "offset": 32768 },
+                  ${BOOT_APP0_PART}
+                  { "path": "firmware.bin",   "offset": 65536 }
+                ]
+              }
+            ]
+          }
+          MANIFEST
+
+
+          # Copy the installer page
+          cp docs/install/index.html site/index.html
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
