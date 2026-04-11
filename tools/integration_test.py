@@ -374,6 +374,12 @@ TEST_CONFIG = {
             "type": "RGB",
             "dmxAddr": 1,
             "channelMap": {"r": 0, "g": 1, "b": 2}
+        },
+        {
+            "name": "Test Light 2",
+            "type": "RGB",
+            "dmxAddr": 4,
+            "channelMap": {"r": 0, "g": 1, "b": 2}
         }
     ]
 }
@@ -822,7 +828,8 @@ def test_light_color_accuracy(api: HueAPI, light_id: str,
                                listener: Optional[ArtNetListener],
                                dmx_start: int, channel_map: dict,
                                results: TestResult, settle_time: float,
-                               device_ip: Optional[str] = None):
+                               device_ip: Optional[str] = None,
+                               light_index: int = 0):
     """
     Test that the color pipeline from Hue API -> Zigbee -> DMX is consistent.
 
@@ -859,8 +866,8 @@ def test_light_color_accuracy(api: HueAPI, light_id: str,
         device_rgb = None
         if device_ip:
             dev_state = get_device_light_state(device_ip)
-            if dev_state and len(dev_state) > 0:
-                ls = dev_state[0]  # First light
+            if dev_state and light_index < len(dev_state):
+                ls = dev_state[light_index]
                 device_rgb = (ls.get("r", 0), ls.get("g", 0), ls.get("b", 0))
                 print(f"    Device reports RGB: R={device_rgb[0]} G={device_rgb[1]} "
                       f"B={device_rgb[2]} (on={ls.get('on')}, bri={ls.get('bri')})")
@@ -1140,7 +1147,7 @@ def main():
                   f"mode={output_cfg.get('mode', 'dmx')}")
             for i, lc in enumerate(lights_cfg):
                 print(f"    [{i}] {lc.get('name')} type={lc.get('type')} "
-                      f"dmxAddr={lc.get('dmxAddr')} (endpoint {10 + i})")
+                      f"dmxAddr={lc.get('dmxAddr')} (endpoint {10 + i * 10})")
 
     # Find matching Hue lights
     print(f"\nSearching for {DEVICE_MANUFACTURER} lights on bridge...")
@@ -1217,10 +1224,10 @@ def main():
     # --- Run tests ---
     results = TestResult()
 
-    for lid in light_ids:
+    for light_index, lid in enumerate(light_ids):
         dmx_start, channel_map = dmx_mappings.get(lid, (1, {"r": 0, "g": 1, "b": 2}))
         print(f"\n{'=' * 60}")
-        print(f"  TESTING LIGHT #{lid} (DMX start={dmx_start}, map={channel_map})")
+        print(f"  TESTING LIGHT #{lid} (index={light_index}, DMX start={dmx_start}, map={channel_map})")
         print(f"{'=' * 60}")
 
         tests_to_run = args.test
@@ -1236,7 +1243,8 @@ def main():
         if tests_to_run in ("all", "accuracy"):
             test_light_color_accuracy(api, lid, listener, dmx_start, channel_map,
                                        results, args.settle_time,
-                                       device_ip=args.device_ip)
+                                       device_ip=args.device_ip,
+                                       light_index=light_index)
         if tests_to_run in ("all", "colortemp"):
             test_light_color_temperature(api, lid, listener, dmx_start, channel_map,
                                           results, args.settle_time)

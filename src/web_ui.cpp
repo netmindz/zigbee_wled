@@ -573,7 +573,7 @@ static void setupRoutes() {
   // Status API
   server.on("/api/status", HTTP_GET, []() {
     JsonDocument doc;
-    doc["wifi"] = WiFi.isConnected() ? WiFi.localIP().toString() : "Not connected";
+    doc["wifi"] = WiFi.isConnected() ? WiFi.SSID() : "Not connected";
     doc["apMode"] = apMode;
     doc["zigbee"] = zigbeeIsPaired() ? "Paired" : "Searching...";
     doc["eui64"] = zigbeeGetEUI64();

@@ -1,6 +1,6 @@
 # Zigbee DMX Bridge
 
-ESP32-C6 firmware that bridges Philips Hue (Zigbee) to DMX512 lighting fixtures. Each configured light appears as a Zigbee HA Color Dimmable Light on the Hue Bridge and outputs color/brightness via wired DMX512 or ArtNet (UDP).
+ESP32-C6 firmware that bridges Philips Hue (Zigbee) to DMX512 lighting fixtures. Each configured light appears as a separate Zigbee Extended Color Light on the Hue Bridge and outputs color/brightness via wired DMX512 or ArtNet (UDP).
 
 ```
 Hue Bridge  ──(Zigbee ZCL)──>  ESP32-C6  ──(DMX512 / ArtNet)──>  RGB/RGBW fixtures
@@ -12,12 +12,13 @@ Hue Bridge  ──(Zigbee ZCL)──>  ESP32-C6  ──(DMX512 / ArtNet)──> 
 
 ## Features
 
-- **Hue-compatible Zigbee endpoints** — each configured light appears as a separate Color Dimmable Light on the Philips Hue Bridge (or other Zigbee coordinators)
-- **Dual output modes** — wired DMX512 via RS-485 transceiver, or ArtNet (Art-Net DMX over UDP broadcast), selectable from the web UI
+- **Hue-compatible Zigbee endpoints** — each configured light appears as a separate Extended Color Light (device ID 0x010D) on the Philips Hue Bridge, with full multi-endpoint discovery support
+- **Dual output modes** — wired DMX512 via RS-485 transceiver, or ArtNet (Art-Net DMX over UDP unicast/broadcast), selectable from the web UI
 - **Up to 16 RGB/RGBW lights** — each with configurable DMX start address and channel-to-offset mapping
 - **Web configuration UI** — captive portal for initial WiFi setup, light management, output mode selection
 - **Config persistence** — all settings stored in NVS (ESP32 Preferences), survive reboots
 - **CIE XY and Hue/Saturation color support** — full color control from the Hue app
+- **Color temperature support** — Hue CT (mirek) commands are converted to RGB for DMX output
 - **Proven Hue Bridge compatibility** — implements all critical pairing requirements discovered through extensive testing (End Device mode, ZLL distributed security, app_device_version=1, raw ZCL command handling)
 
 ## Hardware Requirements
@@ -78,9 +79,10 @@ The web interface is accessible at `http://<device-ip>/` and provides:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/status` | GET | Device status (WiFi, Zigbee, output mode) |
+| `/api/status` | GET | Device status (WiFi SSID, Zigbee, output mode) |
 | `/api/config` | GET | Full configuration (lights + output settings) |
 | `/api/config` | POST | Update configuration (JSON body) |
+| `/api/lights/state` | GET | Current per-light RGB/brightness state |
 | `/api/wifi` | POST | Set WiFi credentials (triggers restart) |
 | `/api/factory-reset` | POST | Erase all config and restart |
 
@@ -96,10 +98,11 @@ Default pin assignment (configurable via web UI):
 
 ### ArtNet
 
-Broadcasts Art-Net OpDmx (0x5000) UDP packets to 255.255.255.255:6454 at ~40Hz. Compatible with any ArtNet-capable DMX node or software (e.g., OLA, QLC+, MagicQ).
+Sends Art-Net OpDmx (0x5000) UDP packets at ~2Hz. Supports unicast to a configurable target IP (recommended) or broadcast to 255.255.255.255. Compatible with any ArtNet-capable DMX node or software (e.g., OLA, QLC+, MagicQ).
 
 Settings (configurable via web UI):
 - Universe: 0-32767
+- Target IP: unicast address (leave blank for broadcast)
 
 ## Hue Bridge Pairing
 
@@ -116,18 +119,15 @@ The firmware implements several critical requirements for Philips Hue Bridge V2 
    - `SET_ATTR_VALUE_CB` doesn't fire for ZCL commands like `move_to_color`
 7. **WiFi/802.15.4 coexistence** — enabled before WiFi starts, re-applied on WiFi reconnect
 
-### Multi-Endpoint Limitation
+### Multi-Endpoint Support
 
-The Hue Bridge typically only discovers the **first light endpoint** on a multi-endpoint device. This is a known Hue Bridge limitation — it was designed for single-endpoint bulbs and does not fully enumerate all active endpoints on a device.
+Each configured light gets its own Zigbee endpoint with spaced numbering (endpoints 10, 20, 30, ...) and device ID `0x010D` (Extended Color Light). This matches the approach used by commercial multi-output Zigbee controllers (e.g., Gledopto 2ID) and ensures the Hue Bridge discovers all endpoints as separate lights.
 
-**Workarounds:**
-- Run "Search for lights" multiple times (sometimes picks up additional endpoints)
-- Use a coordinator that properly supports multi-endpoint devices:
-  - **deCONZ/Phoscon** — Hue API v1 compatible, enumerates all endpoints
-  - **Zigbee2MQTT** — with a custom device converter
-  - **ZHA (Home Assistant)** — full multi-endpoint support out of the box
-
-Use `python3 tools/hue_debug.py --endpoints` to check which endpoints the bridge has discovered.
+**After changing the number of lights**, you must:
+1. Restart the device (endpoints are registered at Zigbee stack startup)
+2. Delete the old light(s) from the Hue Bridge
+3. Erase the Zigbee storage partition: `esptool.py erase_region 0x650000 0x4000`
+4. Re-pair by running "Search for lights" in the Hue app
 
 ## Development Tools
 
@@ -187,6 +187,9 @@ Test suites:
 - **color** — tests saturated red/green/blue via CIE xy coordinates
 - **brightness** — tests brightness scaling at multiple levels
 - **accuracy** — compares actual DMX values against expected values from the CIE XY -> RGB conversion
+- **colortemp** — tests color temperature (mirek) control and RGB conversion
+
+The test auto-discovers all lights belonging to the device and runs all suites against each light independently. With 2 lights configured, the full suite runs 132 tests.
 
 ## Project Structure
 
@@ -242,9 +245,9 @@ The configuration exchanged via `/api/config` follows this format:
 
 ## Known Issues
 
-- **Hue Bridge multi-endpoint discovery** — only the first light endpoint is typically discovered. See [Multi-Endpoint Limitation](#multi-endpoint-limitation) above.
-- **Zigbee reconfiguration requires restart** — changing the number of lights requires a device reboot for Zigbee endpoints to be recreated (endpoints are registered at stack startup and cannot be dynamically changed).
-- **WiFi/Zigbee coexistence** — the 2.4GHz WiFi and 802.15.4 Zigbee share the same radio band. Coexistence is enabled, but in high-interference environments you may see occasional latency.
+- **Zigbee reconfiguration requires restart** — changing the number of lights requires a device reboot and re-pair for Zigbee endpoints to be recreated (endpoints are registered at stack startup and cannot be dynamically changed).
+- **WiFi/Zigbee coexistence** — the 2.4GHz WiFi and 802.15.4 Zigbee share the same radio band. Coexistence is enabled, but expect 1-2s ping latency and occasional packet loss. HTTP requests to the device should use generous timeouts (20s) and retries.
+- **OTA unreliable** — firmware uploads over WiFi frequently fail due to coexistence. Use USB serial for flashing.
 
 ## References
 

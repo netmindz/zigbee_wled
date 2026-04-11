@@ -515,7 +515,7 @@ def print_device_status(device_ip: str):
                 print(f"    [{i}] {light.get('name', '?')} "
                       f"type={light.get('type', '?')} "
                       f"dmxAddr={light.get('dmxAddr', '?')} "
-                      f"(endpoint {10 + i})")
+                      f"(endpoint {10 + i * 10})")
         else:
             print(f"  No lights configured")
     except Exception:

@@ -341,19 +341,19 @@ These guards ensure the coexistence code only compiles when the SDK is configure
 
 ### Performance Impact
 
-WiFi traffic can delay Zigbee responses. The ArtNet output at 40Hz generates constant WiFi traffic. In testing, Zigbee command latency was acceptable (<200ms) even with ArtNet running, but in congested RF environments this could increase.
+WiFi traffic can delay Zigbee responses. The ArtNet output was initially set to 40Hz but caused `ENOMEM` errors flooding the WiFi stack under 802.15.4 coexistence. Reduced to **2Hz (500ms interval)** which is reliable. Broadcast UDP packets were also unreliable under coexistence — solved by adding configurable unicast target IP.
 
 ---
 
-## Multi-Endpoint Discovery Problem
+## Multi-Endpoint Discovery Problem (SOLVED)
 
 ### The Issue
 
-The Hue Bridge V2 typically only discovers the **first light endpoint** on a multi-endpoint device. Our device registers endpoints 10, 11, 12, etc. (one per configured light), but the bridge only creates a Hue light resource for endpoint 10.
+The Hue Bridge V2 initially only discovered the **first light endpoint** on our multi-endpoint device. Our device registered endpoints 10, 11, 12, etc. (one per configured light), but the bridge only created a Hue light resource for endpoint 10.
 
 ### Root Cause
 
-The Hue Bridge was designed for single-endpoint bulbs (all official Hue products are single-endpoint). Its discovery logic:
+The Hue Bridge was designed for single-endpoint bulbs (all official Hue products are single-endpoint). With sequential endpoint numbering (10, 11, 12...) and device ID `0x0102` (Color Dimmable Light), the bridge's discovery logic:
 
 1. Device joins the network
 2. Bridge sends Active Endpoints Request (ZDO 0x0005)
@@ -362,26 +362,24 @@ The Hue Bridge was designed for single-endpoint bulbs (all official Hue products
 5. Bridge creates a light resource for endpoint 10
 6. **Bridge stops.** It does not send Simple Descriptor Request for endpoint 11.
 
-This is a bridge firmware limitation, not a spec compliance issue on the device side. The Zigbee specification requires the coordinator to iterate all active endpoints.
+### Solution
+
+Research into commercial multi-endpoint Zigbee controllers (Gledopto 2ID, Dresden Elektronik FLS-PP lp) revealed two key differences:
+
+1. **Device ID `0x010D`** (Extended Color Light) instead of `0x0102` (Color Dimmable Light) — the ESP-Zigbee SDK doesn't define `0x010D` as a constant, so the raw value is used directly in the endpoint config
+2. **Widely spaced endpoint numbers** (10, 20, 30...) instead of sequential (10, 11, 12...) — controlled by `ZIGBEE_ENDPOINT_SPACING=10`
+
+Both changes together fixed the issue. After re-pairing, the Hue Bridge now discovers all endpoints as separate lights. Confirmed working with 2 endpoints — both appear as "Extended color light" in the Hue app with full color, brightness, and color temperature control.
+
+The `endpointToIndex()` reverse mapping handles the spaced numbering via modulo check and division.
 
 ### Evidence
 
-- Tested with this device: endpoint 10 discovered as Light #25, endpoint 11 never appeared
+- Initial attempt (device ID `0x0102`, sequential endpoints): endpoint 10 discovered as Light #25, endpoint 11 never appeared
+- After fix (device ID `0x010D`, spaced endpoints 10/20): both discovered as Light #26 and Light #27
+- Integration test: 132/132 tests pass across both lights (ON/OFF, color, brightness, accuracy, color temperature)
 - ESP-Zigbee SDK Issue #598: same problem with Amazon Alexa (Echo Plus)
 - ESP-Zigbee SDK Issue #407: Zigbee2MQTT needed a device converter but does discover all endpoints
-
-### Verification
-
-The firmware correctly registers all endpoints. To verify:
-- Enable verbose Zigbee logging: `esp_log_level_set("ZB", ESP_LOG_VERBOSE)`
-- Use a Zigbee sniffer (CC2531 with Wireshark, or another ESP32) to capture the Active Endpoints Response and verify all endpoints are listed
-- Pair the device with Zigbee2MQTT, deCONZ, or ZHA to confirm all endpoints are discovered
-
-### Workarounds
-
-1. **Repeated searches** — sometimes running "Search for lights" multiple times picks up additional endpoints (unreliable)
-2. **Alternative coordinators** — deCONZ/Phoscon, Zigbee2MQTT, or ZHA all properly enumerate multi-endpoint devices
-3. **Single endpoint with internal multiplexing** — register only one Zigbee endpoint that internally maps to multiple DMX channels (loses individual control from the Hue app)
 
 ### Known ESP-Zigbee SDK Multi-Endpoint Bugs
 

@@ -55,6 +55,11 @@ extern "C" {
   #define ZIGBEE_ENDPOINT_BASE 10
 #endif
 
+// Spacing between endpoint numbers (Hue multi-endpoint discovery requires wide spacing)
+#ifndef ZIGBEE_ENDPOINT_SPACING
+  #define ZIGBEE_ENDPOINT_SPACING 10
+#endif
+
 #ifndef ZIGBEE_TASK_STACK_SIZE
   #define ZIGBEE_TASK_STACK_SIZE 16384
 #endif
@@ -205,8 +210,10 @@ static void rgbToXY(uint8_t r, uint8_t g, uint8_t b,
 
 // ---- Helpers: endpoint index from Zigbee endpoint number ----
 static int endpointToIndex(uint8_t endpoint) {
-  int idx = endpoint - ZIGBEE_ENDPOINT_BASE;
-  if (idx < 0 || idx >= MAX_LIGHTS) return -1;
+  int offset = endpoint - ZIGBEE_ENDPOINT_BASE;
+  if (offset < 0 || (offset % ZIGBEE_ENDPOINT_SPACING) != 0) return -1;
+  int idx = offset / ZIGBEE_ENDPOINT_SPACING;
+  if (idx >= MAX_LIGHTS) return -1;
   if (idx >= configStore.getLightCount()) return -1;
   return idx;
 }
@@ -741,7 +748,7 @@ static void createLightEndpoint(esp_zb_ep_list_t *ep_list, uint8_t endpoint, con
   esp_zb_endpoint_config_t endpoint_config = {
     .endpoint = endpoint,
     .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-    .app_device_id = ESP_ZB_HA_COLOR_DIMMABLE_LIGHT_DEVICE_ID,
+    .app_device_id = 0x010D,  // Extended Color Light (Gledopto-style, for Hue multi-endpoint discovery)
     .app_device_version = 1,
   };
   esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
@@ -779,7 +786,7 @@ static void zigbeeTask(void *pvParameters) {
   } else {
     for (uint8_t i = 0; i < count; i++) {
       const LightConfig& cfg = configStore.getLight(i);
-      createLightEndpoint(ep_list, ZIGBEE_ENDPOINT_BASE + i, cfg.name);
+      createLightEndpoint(ep_list, ZIGBEE_ENDPOINT_BASE + (i * ZIGBEE_ENDPOINT_SPACING), cfg.name);
     }
   }
 
@@ -788,7 +795,7 @@ static void zigbeeTask(void *pvParameters) {
   // Patch reportable attribute access flags
   uint8_t epCount = (count > 0) ? count : 1;
   for (uint8_t i = 0; i < epCount; i++) {
-    uint8_t ep = ZIGBEE_ENDPOINT_BASE + i;
+    uint8_t ep = ZIGBEE_ENDPOINT_BASE + (i * ZIGBEE_ENDPOINT_SPACING);
     struct { uint16_t cluster; uint16_t attr; } reportable[] = {
       { ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,       ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID },
       { ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL, ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID },
