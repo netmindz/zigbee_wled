@@ -167,6 +167,7 @@ void DmxOutput::beginArtNet() {
     artnetUdpStarted = true;
   }
   artnetSequence = 1;
+  artnetSendErrors = 0;
 
   const OutputConfig& oc = configStore.getOutputConfig();
   ESP_LOGI("DMX", "ArtNet output initialized (universe=%d)", oc.artnetUniverse);
@@ -179,6 +180,7 @@ void DmxOutput::sendArtNet() {
   if (!artnetUdpStarted) {
     artnetUdp.begin(ARTNET_PORT);
     artnetUdpStarted = true;
+    artnetSendErrors = 0;
     ESP_LOGI("DMX", "ArtNet UDP socket started (late init)");
   }
 
@@ -212,15 +214,42 @@ void DmxOutput::sendArtNet() {
   // DMX data (channels 1-512 from dmxData[1])
   memcpy(&packet[18], &dmxData[1], 512);
 
-  // Broadcast to 255.255.255.255:6454
-  IPAddress broadcastIp(255, 255, 255, 255);
-  artnetUdp.beginPacket(broadcastIp, ARTNET_PORT);
-  artnetUdp.write(packet, 18 + dmxLength);
-  artnetUdp.endPacket();
+  // Determine target: unicast to configured IP, or subnet broadcast
+  IPAddress targetIp;
+  if (oc.artnetTargetIp[0] != '\0' && targetIp.fromString(oc.artnetTargetIp)) {
+    // Unicast to configured target
+  } else {
+    // Subnet broadcast
+    IPAddress localIp = WiFi.localIP();
+    IPAddress subnetMask = WiFi.subnetMask();
+    targetIp = IPAddress(
+      localIp[0] | ~subnetMask[0],
+      localIp[1] | ~subnetMask[1],
+      localIp[2] | ~subnetMask[2],
+      localIp[3] | ~subnetMask[3]
+    );
+  }
 
-  // Increment sequence (1-255, skip 0 which means disabled)
-  artnetSequence++;
-  if (artnetSequence == 0) artnetSequence = 1;
+  artnetUdp.beginPacket(targetIp, ARTNET_PORT);
+  artnetUdp.write(packet, 18 + dmxLength);
+  int ok = artnetUdp.endPacket();
+
+  if (ok) {
+    if (artnetSendErrors > 0) {
+      ESP_LOGI("DMX", "ArtNet send recovered after %lu errors", artnetSendErrors);
+    }
+    artnetSendErrors = 0;
+
+    // Increment sequence (1-255, skip 0 which means disabled)
+    artnetSequence++;
+    if (artnetSequence == 0) artnetSequence = 1;
+  } else {
+    artnetSendErrors++;
+    // Rate-limit logging: only log at powers of 2
+    if ((artnetSendErrors & (artnetSendErrors - 1)) == 0) {
+      ESP_LOGW("DMX", "ArtNet send failed (%lu consecutive)", artnetSendErrors);
+    }
+  }
 }
 
 void DmxOutput::stopArtNet() {
@@ -229,6 +258,7 @@ void DmxOutput::stopArtNet() {
     artnetUdpStarted = false;
   }
   artnetSequence = 0;
+  artnetSendErrors = 0;
 }
 
 // ---- Public API ----

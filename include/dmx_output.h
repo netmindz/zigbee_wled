@@ -55,6 +55,7 @@ private:
 
   // ArtNet state
   uint8_t artnetSequence = 0;
+  uint32_t artnetSendErrors = 0;    // Consecutive send failures
 
   // Wired DMX state
   int dmxPort = -1;  // esp_dmx port number, or -1 if not using

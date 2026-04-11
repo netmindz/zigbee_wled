@@ -41,6 +41,7 @@ struct OutputConfig {
   int8_t enPin  = 4;   // GPIO for RS-485 enable (default GPIO4, -1 = not used)
   // ArtNet settings
   uint16_t artnetUniverse = 0;  // ArtNet universe (0-32767)
+  char artnetTargetIp[16] = {}; // Target IP for unicast, empty/"" = subnet broadcast
 };
 
 struct LightConfig {

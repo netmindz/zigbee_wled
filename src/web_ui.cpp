@@ -160,6 +160,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <label>ArtNet Universe</label>
       <input type="number" id="artnetUniverse" min="0" max="32767" value="0">
     </div>
+    <div class="form-group">
+      <label>Target IP <span style="color:#888;font-size:0.85em">(blank = broadcast)</span></label>
+      <input type="text" id="artnetTargetIp" placeholder="e.g. 192.168.1.100" value="">
+    </div>
   </div>
   <button class="btn btn-primary btn-sm" onclick="saveOutput()" style="margin-top:8px">Save Output Settings</button>
 </div>
@@ -239,7 +243,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </div>
 
 <script>
-let config = { lights: [], output: { mode: 'dmx', txPin: 2, enPin: 4, artnetUniverse: 0 } };
+let config = { lights: [], output: { mode: 'dmx', txPin: 2, enPin: 4, artnetUniverse: 0, artnetTargetIp: '' } };
 let isApMode = false;
 
 async function loadStatus() {
@@ -261,7 +265,7 @@ async function loadConfig() {
   try {
     const r = await fetch('/api/config');
     config = await r.json();
-    if (!config.output) config.output = { mode: 'dmx', txPin: 2, enPin: 4, artnetUniverse: 0 };
+    if (!config.output) config.output = { mode: 'dmx', txPin: 2, enPin: 4, artnetUniverse: 0, artnetTargetIp: '' };
     renderLights();
     renderOutput();
   } catch(e) {
@@ -404,6 +408,7 @@ function renderOutput() {
   document.getElementById('dmxTxPin').value = o.txPin != null ? o.txPin : 2;
   document.getElementById('dmxEnPin').value = o.enPin != null ? o.enPin : 4;
   document.getElementById('artnetUniverse').value = o.artnetUniverse || 0;
+  document.getElementById('artnetTargetIp').value = o.artnetTargetIp || '';
   toggleOutputFields();
 }
 
@@ -419,6 +424,7 @@ async function saveOutput() {
     txPin: parseInt(document.getElementById('dmxTxPin').value) || 2,
     enPin: parseInt(document.getElementById('dmxEnPin').value),
     artnetUniverse: parseInt(document.getElementById('artnetUniverse').value) || 0,
+    artnetTargetIp: document.getElementById('artnetTargetIp').value.trim(),
   };
   await postConfig();
   alert('Output settings saved. Use "Restart Device" to apply changes.');

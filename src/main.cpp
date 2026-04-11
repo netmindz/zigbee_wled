@@ -21,8 +21,11 @@
 #include "web_ui.h"
 #include "zigbee_manager.h"
 
-// DMX update rate (Hz)
-static const unsigned long DMX_UPDATE_INTERVAL_MS = 25;  // ~40 Hz
+// DMX update rates
+// Wired DMX: 40Hz — DMX512 receivers expect continuous refresh
+// ArtNet: 2Hz — WiFi/Zigbee coexistence makes high rates unreliable
+static const unsigned long DMX_UPDATE_INTERVAL_WIRED_MS = 25;   // ~40 Hz
+static const unsigned long DMX_UPDATE_INTERVAL_ARTNET_MS = 500;  // 2 Hz
 static unsigned long lastDmxUpdate = 0;
 
 void setup() {
@@ -77,9 +80,12 @@ void loop() {
   // Handle OTA updates
   ArduinoOTA.handle();
 
-  // Update DMX output at fixed rate
+  // Update DMX output at fixed rate (rate depends on output mode)
   unsigned long now = millis();
-  if (now - lastDmxUpdate >= DMX_UPDATE_INTERVAL_MS) {
+  unsigned long interval = (dmxOutput.getMode() == OUTPUT_MODE_ARTNET)
+                             ? DMX_UPDATE_INTERVAL_ARTNET_MS
+                             : DMX_UPDATE_INTERVAL_WIRED_MS;
+  if (now - lastDmxUpdate >= interval) {
     lastDmxUpdate = now;
 
     uint8_t count = configStore.getLightCount();

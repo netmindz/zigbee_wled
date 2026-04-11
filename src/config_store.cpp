@@ -59,6 +59,7 @@ void ConfigStore::save() {
   prefs.putChar("outTxPin", outputCfg.txPin);
   prefs.putChar("outEnPin", outputCfg.enPin);
   prefs.putUShort("outArtUni", outputCfg.artnetUniverse);
+  prefs.putString("outArtTgtIp", outputCfg.artnetTargetIp);
 
   for (uint8_t i = 0; i < lightCount; i++) {
     char key[16];
@@ -105,6 +106,8 @@ void ConfigStore::load() {
   outputCfg.txPin = prefs.getChar("outTxPin", 2);
   outputCfg.enPin = prefs.getChar("outEnPin", 4);
   outputCfg.artnetUniverse = prefs.getUShort("outArtUni", 0);
+  String targetIp = prefs.getString("outArtTgtIp", "");
+  strlcpy(outputCfg.artnetTargetIp, targetIp.c_str(), sizeof(outputCfg.artnetTargetIp));
 
   for (uint8_t i = 0; i < lightCount; i++) {
     char key[16];
@@ -145,6 +148,9 @@ void ConfigStore::toJson(JsonDocument& doc) const {
   output["txPin"] = outputCfg.txPin;
   output["enPin"] = outputCfg.enPin;
   output["artnetUniverse"] = outputCfg.artnetUniverse;
+  if (outputCfg.artnetTargetIp[0] != '\0') {
+    output["artnetTargetIp"] = outputCfg.artnetTargetIp;
+  }
 
   // Lights
   JsonArray arr = doc["lights"].to<JsonArray>();
@@ -188,8 +194,11 @@ bool ConfigStore::fromJson(const JsonDocument& doc) {
     outputCfg.txPin = outputObj["txPin"] | (int)2;
     outputCfg.enPin = outputObj["enPin"] | (int)4;
     outputCfg.artnetUniverse = outputObj["artnetUniverse"] | (int)0;
-    ESP_LOGI("Config", "fromJson: output mode=%s txPin=%d enPin=%d artUni=%d",
-             mode, outputCfg.txPin, outputCfg.enPin, outputCfg.artnetUniverse);
+    const char* targetIp = outputObj["artnetTargetIp"] | "";
+    strlcpy(outputCfg.artnetTargetIp, targetIp, sizeof(outputCfg.artnetTargetIp));
+    ESP_LOGI("Config", "fromJson: output mode=%s txPin=%d enPin=%d artUni=%d targetIp=%s",
+             mode, outputCfg.txPin, outputCfg.enPin, outputCfg.artnetUniverse,
+             outputCfg.artnetTargetIp);
   }
 
   uint8_t count = 0;
