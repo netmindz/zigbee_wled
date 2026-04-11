@@ -86,6 +86,64 @@ static void zbStartCommissioning(uint8_t mode_mask);
 static void zigbeeTask(void *pvParameters);
 bool zb_raw_command_handler(uint8_t bufid);
 
+// ---- Color temperature (mirek) to RGB conversion ----
+// Attempt to map mirek values to RGB based on Planckian locus approximation.
+// Mirek (micro reciprocal degrees) = 1,000,000 / Kelvin
+// Range: 153 mirek (6500K cool) to 500 mirek (2000K warm)
+
+static void mirekToRGB(uint16_t mirek, uint8_t &r, uint8_t &g, uint8_t &b) {
+  // Clamp mirek to reasonable range
+  if (mirek < 153) mirek = 153;   // 6536K (cool daylight)
+  if (mirek > 500) mirek = 500;   // 2000K (warm candle)
+
+  float kelvin = 1000000.0f / static_cast<float>(mirek);
+  float temp = kelvin / 100.0f;
+
+  float rf, gf, bf;
+
+  // Red
+  if (temp <= 66.0f) {
+    rf = 255.0f;
+  } else {
+    rf = 329.698727446f * powf(temp - 60.0f, -0.1332047592f);
+  }
+
+  // Green
+  if (temp <= 66.0f) {
+    gf = 99.4708025861f * logf(temp) - 161.1195681661f;
+  } else {
+    gf = 288.1221695283f * powf(temp - 60.0f, -0.0755148492f);
+  }
+
+  // Blue
+  if (temp >= 66.0f) {
+    bf = 255.0f;
+  } else if (temp <= 19.0f) {
+    bf = 0.0f;
+  } else {
+    bf = 138.5177312231f * logf(temp - 10.0f) - 305.0447927307f;
+  }
+
+  // Clamp and scale so max component = 255
+  auto clamp = [](float v) -> float { return v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v); };
+  rf = clamp(rf);
+  gf = clamp(gf);
+  bf = clamp(bf);
+
+  // Normalize so max channel = 255 (consistent with xyToRGB behavior)
+  float maxC = rf;
+  if (gf > maxC) maxC = gf;
+  if (bf > maxC) maxC = bf;
+  if (maxC > 0.001f) {
+    float scale = 255.0f / maxC;
+    r = static_cast<uint8_t>(rf * scale + 0.5f);
+    g = static_cast<uint8_t>(gf * scale + 0.5f);
+    b = static_cast<uint8_t>(bf * scale + 0.5f);
+  } else {
+    r = g = b = 255;  // Fallback: white
+  }
+}
+
 // ---- CIE 1931 XY <-> RGB conversions ----
 
 static void xyToRGB(uint16_t zclX, uint16_t zclY,
@@ -154,12 +212,28 @@ static int endpointToIndex(uint8_t endpoint) {
 }
 
 // ---- Update light state from Zigbee command ----
+// transitionDs = transition time in deciseconds (tenths of a second), 0 = instant
 static void updateLightState(uint8_t endpoint, bool power, uint8_t bri,
-                              uint16_t colorX, uint16_t colorY, bool useXY) {
+                              uint16_t colorX, uint16_t colorY, bool useXY,
+                              uint16_t transitionDs = 0) {
   int idx = endpointToIndex(endpoint);
   if (idx < 0) return;
 
   if (zbStateMutex && xSemaphoreTake(zbStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (transitionDs > 0 && lightStates[idx].powerOn && power) {
+      // Set up smooth transition (only if light is staying on)
+      lightStates[idx].transitioning = true;
+      lightStates[idx].transitionStart = millis();
+      lightStates[idx].transitionEnd = lightStates[idx].transitionStart + (transitionDs * 100);
+      lightStates[idx].startBrightness = lightStates[idx].brightness;
+      lightStates[idx].startRed = lightStates[idx].red;
+      lightStates[idx].startGreen = lightStates[idx].green;
+      lightStates[idx].startBlue = lightStates[idx].blue;
+      lightStates[idx].startWhite = lightStates[idx].white;
+    } else {
+      lightStates[idx].transitioning = false;
+    }
+
     lightStates[idx].powerOn = power;
     lightStates[idx].brightness = bri;
     if (useXY) {
@@ -174,7 +248,8 @@ static void updateLightState(uint8_t endpoint, bool power, uint8_t bri,
 }
 
 static void updateLightStateHS(uint8_t endpoint, bool power, uint8_t bri,
-                                uint8_t hue, uint8_t sat) {
+                                uint8_t hue, uint8_t sat,
+                                uint16_t transitionDs = 0) {
   int idx = endpointToIndex(endpoint);
   if (idx < 0) return;
 
@@ -199,11 +274,55 @@ static void updateLightStateHS(uint8_t endpoint, bool power, uint8_t bri,
   else              { rf = c;     gf = 0;     bf = x_val; }
 
   if (zbStateMutex && xSemaphoreTake(zbStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (transitionDs > 0 && lightStates[idx].powerOn && power) {
+      lightStates[idx].transitioning = true;
+      lightStates[idx].transitionStart = millis();
+      lightStates[idx].transitionEnd = lightStates[idx].transitionStart + (transitionDs * 100);
+      lightStates[idx].startBrightness = lightStates[idx].brightness;
+      lightStates[idx].startRed = lightStates[idx].red;
+      lightStates[idx].startGreen = lightStates[idx].green;
+      lightStates[idx].startBlue = lightStates[idx].blue;
+      lightStates[idx].startWhite = lightStates[idx].white;
+    } else {
+      lightStates[idx].transitioning = false;
+    }
+
     lightStates[idx].powerOn = power;
     lightStates[idx].brightness = bri;
     lightStates[idx].red   = static_cast<uint8_t>((rf + m) * 255.0f);
     lightStates[idx].green = static_cast<uint8_t>((gf + m) * 255.0f);
     lightStates[idx].blue  = static_cast<uint8_t>((bf + m) * 255.0f);
+    xSemaphoreGive(zbStateMutex);
+  }
+}
+
+static void updateLightStateCT(uint8_t endpoint, bool power, uint8_t bri,
+                                uint16_t mirek, uint16_t transitionDs = 0) {
+  int idx = endpointToIndex(endpoint);
+  if (idx < 0) return;
+
+  uint8_t r, g, b;
+  mirekToRGB(mirek, r, g, b);
+
+  if (zbStateMutex && xSemaphoreTake(zbStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (transitionDs > 0 && lightStates[idx].powerOn && power) {
+      lightStates[idx].transitioning = true;
+      lightStates[idx].transitionStart = millis();
+      lightStates[idx].transitionEnd = lightStates[idx].transitionStart + (transitionDs * 100);
+      lightStates[idx].startBrightness = lightStates[idx].brightness;
+      lightStates[idx].startRed = lightStates[idx].red;
+      lightStates[idx].startGreen = lightStates[idx].green;
+      lightStates[idx].startBlue = lightStates[idx].blue;
+      lightStates[idx].startWhite = lightStates[idx].white;
+    } else {
+      lightStates[idx].transitioning = false;
+    }
+
+    lightStates[idx].powerOn = power;
+    lightStates[idx].brightness = bri;
+    lightStates[idx].red = r;
+    lightStates[idx].green = g;
+    lightStates[idx].blue = b;
     xSemaphoreGive(zbStateMutex);
   }
 }
@@ -344,6 +463,14 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
           lightStates[idx].red = r;
           lightStates[idx].green = g;
           lightStates[idx].blue = b;
+        } else if (attrId == ESP_ZB_ZCL_ATTR_COLOR_CONTROL_COLOR_TEMPERATURE_ID) {
+          // Color temperature (mirek) changed via attribute write
+          uint16_t mirek = *(const uint16_t *)msg->attribute.data.value;
+          uint8_t r, g, b;
+          mirekToRGB(mirek, r, g, b);
+          lightStates[idx].red = r;
+          lightStates[idx].green = g;
+          lightStates[idx].blue = b;
         }
         break;
     }
@@ -418,6 +545,7 @@ bool zb_raw_command_handler(uint8_t bufid) {
     if (payload_len < 3) return false;
 
     uint8_t level = payload[0];
+    uint16_t transitionDs = payload[1] | (payload[2] << 8);
     bool newPower;
     if (cmd_info->cmd_id == 0x04) {
       newPower = (level > 0);
@@ -428,7 +556,7 @@ bool zb_raw_command_handler(uint8_t bufid) {
 
     uint16_t curX, curY;
     readCurrentColorXY(endpoint, curX, curY);
-    updateLightState(endpoint, newPower, level, curX, curY, true);
+    updateLightState(endpoint, newPower, level, curX, curY, true, transitionDs);
 
     return false;
   }
@@ -443,10 +571,11 @@ bool zb_raw_command_handler(uint8_t bufid) {
 
     uint16_t colorX = payload[0] | (payload[1] << 8);
     uint16_t colorY = payload[2] | (payload[3] << 8);
+    uint16_t transitionDs = payload[4] | (payload[5] << 8);
 
     bool curPower; uint8_t curLevel;
     readCurrentOnOffLevel(endpoint, curPower, curLevel);
-    updateLightState(endpoint, curPower, curLevel, colorX, colorY, true);
+    updateLightState(endpoint, curPower, curLevel, colorX, colorY, true, transitionDs);
 
     return false;
   }
@@ -461,10 +590,11 @@ bool zb_raw_command_handler(uint8_t bufid) {
 
     uint8_t hue = payload[0];
     uint8_t sat = payload[1];
+    uint16_t transitionDs = payload[2] | (payload[3] << 8);
 
     bool curPower; uint8_t curLevel;
     readCurrentOnOffLevel(endpoint, curPower, curLevel);
-    updateLightStateHS(endpoint, curPower, curLevel, hue, sat);
+    updateLightStateHS(endpoint, curPower, curLevel, hue, sat, transitionDs);
 
     return false;
   }
@@ -478,6 +608,8 @@ bool zb_raw_command_handler(uint8_t bufid) {
     if (payload_len < 4) return false;
 
     uint8_t hue = payload[0];
+    // payload[1] = direction (ignored for simplicity)
+    uint16_t transitionDs = payload[2] | (payload[3] << 8);
 
     bool curPower; uint8_t curLevel;
     readCurrentOnOffLevel(endpoint, curPower, curLevel);
@@ -488,7 +620,7 @@ bool zb_raw_command_handler(uint8_t bufid) {
       ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_SATURATION_ID);
     if (attr && attr->data_p) curSat = *(uint8_t *)attr->data_p;
 
-    updateLightStateHS(endpoint, curPower, curLevel, hue, curSat);
+    updateLightStateHS(endpoint, curPower, curLevel, hue, curSat, transitionDs);
     return false;
   }
 
@@ -501,6 +633,7 @@ bool zb_raw_command_handler(uint8_t bufid) {
     if (payload_len < 3) return false;
 
     uint8_t sat = payload[0];
+    uint16_t transitionDs = payload[1] | (payload[2] << 8);
 
     bool curPower; uint8_t curLevel;
     readCurrentOnOffLevel(endpoint, curPower, curLevel);
@@ -511,7 +644,32 @@ bool zb_raw_command_handler(uint8_t bufid) {
       ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_HUE_ID);
     if (attr && attr->data_p) curHue = *(uint8_t *)attr->data_p;
 
-    updateLightStateHS(endpoint, curPower, curLevel, curHue, sat);
+    updateLightStateHS(endpoint, curPower, curLevel, curHue, sat, transitionDs);
+    return false;
+  }
+
+  // ---- Color Control: move_to_color_temperature (0x0A) ----
+  if (cmd_info->cluster_id == ESP_ZB_ZCL_CLUSTER_ID_COLOR_CONTROL &&
+      !cmd_info->is_common_command && cmd_info->cmd_id == 0x0A) {
+
+    uint8_t *payload = (uint8_t *)zb_buf_begin(bufid);
+    zb_uint_t payload_len = zb_buf_len(bufid);
+    if (payload_len < 4) return false;
+
+    uint16_t mirek = payload[0] | (payload[1] << 8);
+    uint16_t transitionDs = payload[2] | (payload[3] << 8);
+
+    bool curPower; uint8_t curLevel;
+    readCurrentOnOffLevel(endpoint, curPower, curLevel);
+    updateLightStateCT(endpoint, curPower, curLevel, mirek, transitionDs);
+
+    // Update the color temperature attribute in the cache
+    esp_zb_zcl_set_attribute_val(endpoint,
+      ESP_ZB_ZCL_CLUSTER_ID_COLOR_CONTROL, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      ESP_ZB_ZCL_ATTR_COLOR_CONTROL_COLOR_TEMPERATURE_ID, &mirek, false);
+
+    ESP_LOGD("ZB", "move_to_color_temp: ep=%d mirek=%d transition=%dds",
+             endpoint, mirek, transitionDs);
     return false;
   }
 
@@ -522,9 +680,24 @@ bool zb_raw_command_handler(uint8_t bufid) {
 static void createLightEndpoint(esp_zb_ep_list_t *ep_list, uint8_t endpoint, const char* name) {
   esp_zb_color_dimmable_light_cfg_t light_cfg = ESP_ZB_DEFAULT_COLOR_DIMMABLE_LIGHT_CONFIG();
   light_cfg.basic_cfg.power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DC_SOURCE;
-  light_cfg.color_cfg.color_capabilities = 0x0009;  // HS + XY
+  light_cfg.color_cfg.color_capabilities = 0x0019;  // HS + XY + CT
 
   esp_zb_cluster_list_t *cluster_list = esp_zb_color_dimmable_light_clusters_create(&light_cfg);
+
+  // Add color temperature attributes (required for CT support)
+  esp_zb_attribute_list_t *color_cluster = esp_zb_cluster_list_get_cluster(
+    cluster_list, ESP_ZB_ZCL_CLUSTER_ID_COLOR_CONTROL, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+  if (color_cluster) {
+    uint16_t ct_default = 0x00fa;  // 250 mirek (4000K)
+    uint16_t ct_min = 153;   // 6536K (cool daylight)
+    uint16_t ct_max = 500;   // 2000K (warm candle)
+    esp_zb_color_control_cluster_add_attr(color_cluster,
+      ESP_ZB_ZCL_ATTR_COLOR_CONTROL_COLOR_TEMPERATURE_ID, &ct_default);
+    esp_zb_color_control_cluster_add_attr(color_cluster,
+      ESP_ZB_ZCL_ATTR_COLOR_CONTROL_COLOR_TEMP_PHYSICAL_MIN_MIREDS_ID, &ct_min);
+    esp_zb_color_control_cluster_add_attr(color_cluster,
+      ESP_ZB_ZCL_ATTR_COLOR_CONTROL_COLOR_TEMP_PHYSICAL_MAX_MIREDS_ID, &ct_max);
+  }
 
   // Add extra on_off attributes required by Hue
   esp_zb_attribute_list_t *on_off_cluster = esp_zb_cluster_list_get_cluster(
@@ -621,6 +794,7 @@ static void zigbeeTask(void *pvParameters) {
       { ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL, ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID },
       { ESP_ZB_ZCL_CLUSTER_ID_COLOR_CONTROL, ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_X_ID },
       { ESP_ZB_ZCL_CLUSTER_ID_COLOR_CONTROL, ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_Y_ID },
+      { ESP_ZB_ZCL_CLUSTER_ID_COLOR_CONTROL, ESP_ZB_ZCL_ATTR_COLOR_CONTROL_COLOR_TEMPERATURE_ID },
     };
     for (auto &ra : reportable) {
       esp_zb_zcl_attr_t *a = esp_zb_zcl_get_attribute(ep, ra.cluster,
@@ -680,6 +854,14 @@ void zigbeeSetup() {
     lightStates[i].green = 255;
     lightStates[i].blue = 255;
     lightStates[i].white = 0;
+    lightStates[i].transitioning = false;
+    lightStates[i].transitionStart = 0;
+    lightStates[i].transitionEnd = 0;
+    lightStates[i].startBrightness = 254;
+    lightStates[i].startRed = 255;
+    lightStates[i].startGreen = 255;
+    lightStates[i].startBlue = 255;
+    lightStates[i].startWhite = 0;
   }
 
   // Configure Zigbee platform

@@ -59,6 +59,18 @@ struct LightState {
   uint8_t  green;
   uint8_t  blue;
   uint8_t  white;        // only used for RGBW
+
+  // Transition support: when a transition is active, we interpolate from
+  // start values to current (target) values over the transition period.
+  // All times in milliseconds (from millis()).
+  bool     transitioning;
+  uint32_t transitionStart;   // millis() when transition began
+  uint32_t transitionEnd;     // millis() when transition should finish
+  uint8_t  startBrightness;
+  uint8_t  startRed;
+  uint8_t  startGreen;
+  uint8_t  startBlue;
+  uint8_t  startWhite;
 };
 
 class ConfigStore {
