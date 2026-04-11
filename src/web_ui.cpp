@@ -13,6 +13,7 @@
 
 #include "web_ui.h"
 #include "config_store.h"
+#include "dmx_output.h"
 #include "zigbee_manager.h"
 
 #include <WiFi.h>
@@ -20,6 +21,7 @@
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <Update.h>
 
 static WebServer server(80);
 static DNSServer dnsServer;
@@ -50,7 +52,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .status-item { background: #0f3460; padding: 8px 16px; border-radius: 6px; }
   .status-item .label { font-size: 0.8em; color: #888; }
   .status-item .value { font-size: 1.1em; color: #00d4ff; }
-  .light { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+  .light { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; }
+  .light-preview { width: 36px; height: 36px; border-radius: 6px; border: 2px solid #0f3460;
+                   background: #000; flex-shrink: 0; }
   .light-info { display: flex; flex-direction: column; gap: 4px; }
   .light-name { font-weight: bold; color: #e0e0e0; }
   .light-detail { font-size: 0.85em; color: #888; }
@@ -125,13 +129,63 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <button class="btn btn-primary btn-sm" onclick="showAddLight()">+ Add Light</button>
   </div>
   <div id="lightList">
-    <div class="empty-state">No lights configured. Add one to get started.</div>
+    <div class="empty-state" id="loadingState">Loading configuration...</div>
   </div>
+</div>
+
+<!-- Output Settings -->
+<div class="card">
+  <h3 style="color:#00d4ff;margin-bottom:12px">Output Settings</h3>
+  <div class="form-group">
+    <label>Output Mode</label>
+    <select id="outputMode" onchange="toggleOutputFields()">
+      <option value="dmx">Wired DMX (RS-485)</option>
+      <option value="artnet">ArtNet (UDP)</option>
+    </select>
+  </div>
+  <div id="dmxFields">
+    <div class="form-row">
+      <div class="form-group">
+        <label>TX Pin (GPIO)</label>
+        <input type="number" id="dmxTxPin" min="-1" max="48" value="2">
+      </div>
+      <div class="form-group">
+        <label>Enable Pin (GPIO, -1=none)</label>
+        <input type="number" id="dmxEnPin" min="-1" max="48" value="4">
+      </div>
+    </div>
+  </div>
+  <div id="artnetFields" style="display:none">
+    <div class="form-group">
+      <label>ArtNet Universe</label>
+      <input type="number" id="artnetUniverse" min="0" max="32767" value="0">
+    </div>
+  </div>
+  <button class="btn btn-primary btn-sm" onclick="saveOutput()" style="margin-top:8px">Save Output Settings</button>
 </div>
 
 <!-- Actions -->
 <div class="actions">
+  <button class="btn btn-sm" style="background:#0f3460" onclick="restartDevice()">Restart Device</button>
   <button class="btn btn-danger btn-sm" onclick="factoryReset()">Factory Reset</button>
+</div>
+
+<!-- OTA Firmware Update -->
+<div class="card" style="margin-top:12px">
+  <h3 style="color:#00d4ff;margin-bottom:12px">Firmware Update</h3>
+  <form id="otaForm" method="POST" action="/api/ota" enctype="multipart/form-data">
+    <div class="form-group">
+      <label>Select firmware binary (.bin)</label>
+      <input type="file" name="firmware" accept=".bin" id="otaFile">
+    </div>
+    <button class="btn btn-primary btn-sm" type="button" onclick="uploadOTA()">Upload &amp; Flash</button>
+    <div id="otaProgress" style="margin-top:8px;display:none">
+      <div style="background:#0f3460;border-radius:4px;overflow:hidden;height:24px">
+        <div id="otaBar" style="background:#00d4ff;height:100%;width:0%;transition:width 0.3s"></div>
+      </div>
+      <div id="otaStatus" style="font-size:0.85em;color:#aaa;margin-top:4px">Uploading...</div>
+    </div>
+  </form>
 </div>
 
 <!-- Add/Edit Light Modal -->
@@ -185,7 +239,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </div>
 
 <script>
-let config = { lights: [] };
+let config = { lights: [], output: { mode: 'dmx', txPin: 2, enPin: 4, artnetUniverse: 0 } };
 let isApMode = false;
 
 async function loadStatus() {
@@ -207,10 +261,32 @@ async function loadConfig() {
   try {
     const r = await fetch('/api/config');
     config = await r.json();
+    if (!config.output) config.output = { mode: 'dmx', txPin: 2, enPin: 4, artnetUniverse: 0 };
     renderLights();
+    renderOutput();
   } catch(e) {
     console.error('Failed to load config:', e);
   }
+}
+
+async function loadLightStates() {
+  try {
+    const r = await fetch('/api/lights/state');
+    const data = await r.json();
+    const lights = data.lights || [];
+    for (let i = 0; i < lights.length; i++) {
+      const el = document.getElementById('preview-' + i);
+      if (!el) continue;
+      const l = lights[i];
+      if (l.on) {
+        el.style.background = 'rgb(' + l.r + ',' + l.g + ',' + l.b + ')';
+        el.style.boxShadow = '0 0 8px rgba(' + l.r + ',' + l.g + ',' + l.b + ',0.5)';
+      } else {
+        el.style.background = '#111';
+        el.style.boxShadow = 'none';
+      }
+    }
+  } catch(e) { /* ignore */ }
 }
 
 function renderLights() {
@@ -218,7 +294,7 @@ function renderLights() {
   document.getElementById('lightCountStatus').textContent = config.lights.length;
 
   if (config.lights.length === 0) {
-    list.innerHTML = '<div class="empty-state">No lights configured. Add one to get started.</div>';
+    list.innerHTML = '<div class="empty-state" id="emptyState">No lights configured. Add one to get started.</div>';
     return;
   }
 
@@ -227,6 +303,7 @@ function renderLights() {
     const mapStr = `R:${l.channelMap.r} G:${l.channelMap.g} B:${l.channelMap.b}` +
       (l.type === 'RGBW' ? ` W:${l.channelMap.w}` : '');
     return `<div class="card light">
+      <div class="light-preview" id="preview-${i}"></div>
       <div class="light-info">
         <div class="light-name">${escHtml(l.name)} <span class="tag ${tagClass}">${l.type}</span></div>
         <div class="light-detail">DMX ${l.dmxAddr} | Map: ${mapStr} | Endpoint ${10 + i}</div>
@@ -321,6 +398,32 @@ async function deleteLight(i) {
   renderLights();
 }
 
+function renderOutput() {
+  const o = config.output || {};
+  document.getElementById('outputMode').value = o.mode || 'dmx';
+  document.getElementById('dmxTxPin').value = o.txPin != null ? o.txPin : 2;
+  document.getElementById('dmxEnPin').value = o.enPin != null ? o.enPin : 4;
+  document.getElementById('artnetUniverse').value = o.artnetUniverse || 0;
+  toggleOutputFields();
+}
+
+function toggleOutputFields() {
+  const mode = document.getElementById('outputMode').value;
+  document.getElementById('dmxFields').style.display = (mode === 'dmx') ? 'block' : 'none';
+  document.getElementById('artnetFields').style.display = (mode === 'artnet') ? 'block' : 'none';
+}
+
+async function saveOutput() {
+  config.output = {
+    mode: document.getElementById('outputMode').value,
+    txPin: parseInt(document.getElementById('dmxTxPin').value) || 2,
+    enPin: parseInt(document.getElementById('dmxEnPin').value),
+    artnetUniverse: parseInt(document.getElementById('artnetUniverse').value) || 0,
+  };
+  await postConfig();
+  alert('Output settings saved. Use "Restart Device" to apply changes.');
+}
+
 async function postConfig() {
   try {
     await fetch('/api/config', {
@@ -360,11 +463,68 @@ async function factoryReset() {
   }
 }
 
-// Initial load
-loadStatus();
-loadConfig();
-// Refresh status every 5s
+async function restartDevice() {
+  if (!confirm('Restart the device?')) return;
+  try {
+    await fetch('/api/restart', { method: 'POST' });
+    document.getElementById('wifiStatus').textContent = 'Restarting...';
+    document.getElementById('zbStatus').textContent = '...';
+  } catch(e) { /* expected - device is restarting */ }
+}
+
+function uploadOTA() {
+  const fileInput = document.getElementById('otaFile');
+  if (!fileInput.files.length) { alert('Please select a firmware file'); return; }
+  if (!confirm('Upload and flash firmware? The device will restart after flashing.')) return;
+
+  const file = fileInput.files[0];
+  const formData = new FormData();
+  formData.append('firmware', file);
+
+  const xhr = new XMLHttpRequest();
+  const progress = document.getElementById('otaProgress');
+  const bar = document.getElementById('otaBar');
+  const status = document.getElementById('otaStatus');
+
+  progress.style.display = 'block';
+  status.textContent = 'Uploading...';
+  bar.style.width = '0%';
+
+  xhr.upload.addEventListener('progress', function(e) {
+    if (e.lengthComputable) {
+      const pct = Math.round((e.loaded / e.total) * 100);
+      bar.style.width = pct + '%';
+      status.textContent = 'Uploading: ' + pct + '%';
+    }
+  });
+
+  xhr.addEventListener('load', function() {
+    if (xhr.status === 200) {
+      bar.style.width = '100%';
+      status.textContent = 'Flashing complete! Device is restarting...';
+      status.style.color = '#00d4ff';
+    } else {
+      status.textContent = 'Upload failed: ' + xhr.responseText;
+      status.style.color = '#e74c3c';
+    }
+  });
+
+  xhr.addEventListener('error', function() {
+    status.textContent = 'Upload failed (network error)';
+    status.style.color = '#e74c3c';
+  });
+
+  xhr.open('POST', '/api/ota');
+  xhr.send(formData);
+}
+
+// Initial load - fetch both in parallel
+Promise.all([loadStatus(), loadConfig()]).then(() => {
+  document.getElementById('loadingState')?.remove();
+});
+// Refresh status every 5s, light previews every 1s
 setInterval(loadStatus, 5000);
+setInterval(loadLightStates, 1000);
 </script>
 </body>
 </html>
@@ -405,7 +565,30 @@ static void setupRoutes() {
     doc["zigbee"] = zigbeeIsPaired() ? "Paired" : "Searching...";
     doc["eui64"] = zigbeeGetEUI64();
     doc["lightCount"] = configStore.getLightCount();
+    const OutputConfig& oc = configStore.getOutputConfig();
+    doc["outputMode"] = (oc.mode == OUTPUT_MODE_ARTNET) ? "artnet" : "dmx";
 
+    String json;
+    serializeJson(doc, json);
+    server.send(200, "application/json", json);
+  });
+
+  // Light states API - returns current RGB output per light
+  server.on("/api/lights/state", HTTP_GET, []() {
+    JsonDocument doc;
+    JsonArray arr = doc["lights"].to<JsonArray>();
+    uint8_t count = configStore.getLightCount();
+    for (uint8_t i = 0; i < count; i++) {
+      const LightState& st = zigbeeGetLightState(i);
+      JsonObject obj = arr.add<JsonObject>();
+      obj["on"] = st.powerOn;
+      obj["bri"] = st.brightness;
+      // Compute the effective DMX RGB (after brightness scaling)
+      float briScale = st.powerOn ? (static_cast<float>(st.brightness) / 254.0f) : 0.0f;
+      obj["r"] = static_cast<uint8_t>(st.red * briScale);
+      obj["g"] = static_cast<uint8_t>(st.green * briScale);
+      obj["b"] = static_cast<uint8_t>(st.blue * briScale);
+    }
     String json;
     serializeJson(doc, json);
     server.send(200, "application/json", json);
@@ -448,6 +631,8 @@ static void setupRoutes() {
       ESP_LOGI("Web", "Config saved: %d lights", configStore.getLightCount());
       // Signal Zigbee to reconfigure endpoints
       zigbeeReconfigure();
+      // Reconfigure DMX output (mode/pins may have changed)
+      dmxOutput.reconfigure();
       server.send(200, "application/json", "{\"ok\":true}");
     } else {
       ESP_LOGE("Web", "fromJson failed - doc contents:");
@@ -505,6 +690,51 @@ static void setupRoutes() {
     delay(1000);
     ESP.restart();
   });
+
+  // Restart API
+  server.on("/api/restart", HTTP_POST, []() {
+    server.send(200, "application/json", "{\"ok\":true}");
+    delay(1000);
+    ESP.restart();
+  });
+
+  // OTA firmware update endpoint
+  server.on("/api/ota", HTTP_POST,
+    // Response handler (called after upload completes)
+    []() {
+      if (Update.hasError()) {
+        server.send(500, "text/plain", "OTA update failed");
+      } else {
+        server.send(200, "text/plain", "OK");
+        delay(1000);
+        ESP.restart();
+      }
+    },
+    // Upload handler (called for each chunk)
+    []() {
+      HTTPUpload& upload = server.upload();
+
+      if (upload.status == UPLOAD_FILE_START) {
+        ESP_LOGI("OTA", "OTA upload start: %s (%u bytes)", upload.filename.c_str(), upload.totalSize);
+        // Stop DMX during OTA to free resources
+        dmxOutput.stop();
+
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          ESP_LOGE("OTA", "Update.begin failed: %s", Update.errorString());
+        }
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+          ESP_LOGE("OTA", "Update.write failed: %s", Update.errorString());
+        }
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) {
+          ESP_LOGI("OTA", "OTA upload complete: %u bytes", upload.totalSize);
+        } else {
+          ESP_LOGE("OTA", "Update.end failed: %s", Update.errorString());
+        }
+      }
+    }
+  );
 
   // Captive portal redirect - catch all requests and redirect to config page
   server.onNotFound([]() {
