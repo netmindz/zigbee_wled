@@ -581,7 +581,9 @@ static void setupRoutes() {
     JsonDocument doc;
     doc["wifi"] = WiFi.isConnected() ? WiFi.SSID() : "Not connected";
     doc["apMode"] = apMode;
-    doc["zigbee"] = zigbeeIsPaired() ? "Paired" : "Searching...";
+    doc["zigbee"] = !zigbeeIsEnabled() ? "Disabled - no lights configured"
+                   : zigbeeIsPaired() ? "Paired"
+                   : "Searching...";
     doc["eui64"] = zigbeeGetEUI64();
     doc["lightCount"] = configStore.getLightCount();
     const OutputConfig& oc = configStore.getOutputConfig();

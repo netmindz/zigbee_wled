@@ -71,6 +71,7 @@ extern "C" {
 // ---- Module state ----
 static bool zbInitDone    = false;
 static bool zbStarted     = false;
+static bool zbSuppressed  = false;   // true when no lights configured (skip Zigbee)
 static volatile bool zbPaired = false;
 static TaskHandle_t zbTaskHandle = nullptr;
 static SemaphoreHandle_t zbStateMutex = nullptr;
@@ -810,22 +811,15 @@ static void zigbeeTask(void *pvParameters) {
   esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
   uint8_t count = configStore.getLightCount();
 
-  if (count == 0) {
-    // Create at least one default endpoint so the device can join
-    createLightEndpoint(ep_list, ZIGBEE_ENDPOINT_BASE, "Default Light");
-    ESP_LOGW("ZB", "No lights configured, created default endpoint");
-  } else {
-    for (uint8_t i = 0; i < count; i++) {
-      const LightConfig& cfg = configStore.getLight(i);
-      createLightEndpoint(ep_list, ZIGBEE_ENDPOINT_BASE + (i * ZIGBEE_ENDPOINT_SPACING), cfg.name);
-    }
+  for (uint8_t i = 0; i < count; i++) {
+    const LightConfig& cfg = configStore.getLight(i);
+    createLightEndpoint(ep_list, ZIGBEE_ENDPOINT_BASE + (i * ZIGBEE_ENDPOINT_SPACING), cfg.name);
   }
 
   esp_zb_device_register(ep_list);
 
   // Patch reportable attribute access flags
-  uint8_t epCount = (count > 0) ? count : 1;
-  for (uint8_t i = 0; i < epCount; i++) {
+  for (uint8_t i = 0; i < count; i++) {
     uint8_t ep = ZIGBEE_ENDPOINT_BASE + (i * ZIGBEE_ENDPOINT_SPACING);
     struct { uint16_t cluster; uint16_t attr; } reportable[] = {
       { ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,       ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID },
@@ -851,7 +845,7 @@ static void zigbeeTask(void *pvParameters) {
   zb_zdo_pim_set_long_poll_interval(1000);
   zb_zdo_pim_toggle_turbo_poll_retry_feature(ZB_TRUE);
 
-  ESP_LOGI("ZB", "Zigbee stack started with %d endpoint(s)", epCount);
+  ESP_LOGI("ZB", "Zigbee stack started with %d endpoint(s)", count);
 
   // Run main loop — never returns
   esp_zb_stack_main_loop();
@@ -904,6 +898,14 @@ void zigbeeSetup() {
     lightStates[i].startWhite = w;
   }
 
+  // If no lights configured, suppress Zigbee entirely.
+  // The user must add at least one light via the web UI and restart.
+  if (configStore.getLightCount() == 0) {
+    zbSuppressed = true;
+    ESP_LOGW("ZB", "No lights configured — Zigbee disabled. Add lights via web UI and restart.");
+    return;
+  }
+
   // Configure Zigbee platform
   esp_zb_platform_config_t platform_cfg = {};
   platform_cfg.radio_config.radio_mode          = ZB_RADIO_MODE_NATIVE;
@@ -938,6 +940,10 @@ void zigbeeStart() {
   } else {
     ESP_LOGE("ZB", "Failed to create Zigbee task");
   }
+}
+
+bool zigbeeIsEnabled() {
+  return !zbSuppressed;
 }
 
 bool zigbeeIsPaired() {
@@ -984,6 +990,7 @@ void zigbeeSetup() {
   ESP_LOGE("ZB", "Zigbee requires ESP32-C6 or ESP32-C5!");
 }
 void zigbeeStart() {}
+bool zigbeeIsEnabled() { return false; }
 bool zigbeeIsPaired() { return false; }
 const char* zigbeeGetEUI64() { return "N/A"; }
 const LightState& zigbeeGetLightState(uint8_t index) {

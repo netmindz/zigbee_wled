@@ -20,6 +20,9 @@ void zigbeeSetup();
 // Start the Zigbee task (call after WiFi STA connects)
 void zigbeeStart();
 
+// Check if Zigbee is enabled (false when no lights configured)
+bool zigbeeIsEnabled();
+
 // Check if Zigbee has joined a network
 bool zigbeeIsPaired();
 
