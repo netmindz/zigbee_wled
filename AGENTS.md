@@ -46,6 +46,9 @@ python3 tools/integration_test.py --device-ip <IP> --test accuracy
 python3 tools/integration_test.py --device-ip <IP> --test colortemp
 python3 tools/integration_test.py --device-ip <IP> --test rgbw
 
+# Run only SSE tests (no Hue Bridge required)
+python3 tools/integration_test.py --device-ip <IP> --test sse
+
 # Skip ArtNet verification (Hue API only)
 python3 tools/integration_test.py --device-ip <IP> --skip-artnet
 
@@ -71,7 +74,7 @@ src/                    # C++ source files (Arduino framework)
   zigbee_manager.cpp    # Zigbee endpoints, Hue pairing, ZCL handler
   wled_output.cpp       # HTTP POST to WLED /json/state
   wled_discovery.cpp    # mDNS scan + /json/info query
-  web_ui.cpp            # Web server, REST API, WiFi manager, OTA
+  web_ui.cpp            # esp_http_server, REST API, SSE, WiFi manager, OTA
 include/                # Header files (one per module)
 partitions/             # Custom ESP32 flash partition tables
 tools/                  # Python debug/test utilities
@@ -146,11 +149,12 @@ Each module has a matching `include/<name>.h` / `src/<name>.cpp` pair.
 ## Architecture Notes
 
 - Zigbee ZBOSS stack runs in its own FreeRTOS task (16KB stack, priority 5)
-- Arduino `loop()` handles web server + WLED output at ~2Hz
+- Arduino `loop()` handles WLED output at ~2Hz, WiFi reconnect, and SSE event pushing
+- ESP-IDF `esp_http_server` runs in its own FreeRTOS task (no handleClient() in loop)
 - ESP32-C6 shares a single 2.4GHz radio for WiFi and Zigbee (expect 1-2s latency)
 - HTTP timeouts set to 20s; change detection avoids redundant WLED requests
 - Changing the number of lights requires reboot, Zigbee storage erase, and re-pairing
-- Flash usage is ~91% on 4MB -- near capacity; be mindful of code size
+- Flash usage is ~92% on 4MB -- near capacity; be mindful of code size
 - Target board: `esp32-c6-devkitc-1` with custom partition tables including
   `zb_storage` and `zb_fct` for the Zigbee stack
 - Conditional compilation with `CONFIG_IDF_TARGET_ESP32C6` guards; stub

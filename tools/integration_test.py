@@ -1492,6 +1492,392 @@ def test_rgbw_accuracy(api: HueAPI, light_id: str,
 
 
 # ---------------------------------------------------------------------------
+#  SSE (Server-Sent Events) test helpers and scenarios
+# ---------------------------------------------------------------------------
+
+class SSEClient:
+    """
+    Minimal SSE client using requests with stream=True.
+    Parses named events (event: / data:) and comments (lines starting with :).
+    Uses the same retry/timeout strategy as other device requests.
+    """
+
+    def __init__(self, url: str, timeout: int = DEVICE_TIMEOUT):
+        self.url = url
+        self.timeout = timeout
+        self.response = None
+        self.events: list = []       # list of (event_name, data_json_str)
+        self.comments: list = []     # list of comment strings (keepalive etc.)
+        self._thread = None
+        self._running = False
+        self._lock = threading.Lock()
+
+    def connect(self) -> bool:
+        """Open the SSE stream. Returns True on success."""
+        try:
+            self.response = requests.get(
+                self.url, stream=True, timeout=self.timeout)
+            self.response.raise_for_status()
+        except Exception as e:
+            print(f"  SSE connect failed: {e}")
+            return False
+        self._running = True
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        return True
+
+    def close(self):
+        """Close the SSE stream."""
+        self._running = False
+        if self.response:
+            try:
+                self.response.close()
+            except Exception:
+                pass
+            self.response = None
+        if self._thread:
+            self._thread.join(timeout=3)
+            self._thread = None
+
+    def _read_loop(self):
+        """Background thread: read lines from the chunked HTTP response."""
+        current_event = None
+        current_data = None
+        try:
+            for line_bytes in self.response.iter_lines():
+                if not self._running:
+                    break
+                line = line_bytes.decode("utf-8", errors="replace")
+
+                if line.startswith(":"):
+                    # SSE comment (e.g. ": keepalive")
+                    with self._lock:
+                        self.comments.append(line)
+                elif line.startswith("event: "):
+                    current_event = line[7:]
+                elif line.startswith("data: "):
+                    current_data = line[6:]
+                elif line == "":
+                    # Blank line = end of event
+                    if current_event and current_data is not None:
+                        with self._lock:
+                            self.events.append((current_event, current_data))
+                    current_event = None
+                    current_data = None
+        except Exception:
+            # Connection closed or error — expected on disconnect
+            pass
+
+    def wait_for_events(self, count: int, timeout: float = 10.0) -> list:
+        """Wait until at least `count` events are collected, return all events."""
+        start = time.time()
+        while time.time() - start < timeout:
+            with self._lock:
+                if len(self.events) >= count:
+                    return list(self.events)
+            time.sleep(0.2)
+        with self._lock:
+            return list(self.events)
+
+    def wait_for_event_named(self, name: str, min_index: int = 0,
+                             timeout: float = 10.0) -> Optional[str]:
+        """Wait for an event with the given name (at index >= min_index).
+        Returns the data string, or None on timeout."""
+        start = time.time()
+        while time.time() - start < timeout:
+            with self._lock:
+                for i in range(min_index, len(self.events)):
+                    if self.events[i][0] == name:
+                        return self.events[i][1]
+            time.sleep(0.2)
+        return None
+
+    def wait_for_comment(self, timeout: float = 20.0) -> bool:
+        """Wait for at least one SSE comment (keepalive). Returns True if received."""
+        start = time.time()
+        while time.time() - start < timeout:
+            with self._lock:
+                if self.comments:
+                    return True
+            time.sleep(0.5)
+        return False
+
+    def event_count(self) -> int:
+        with self._lock:
+            return len(self.events)
+
+    def clear(self):
+        with self._lock:
+            self.events.clear()
+            self.comments.clear()
+
+
+def test_sse_initial_events(device_ip: str, results: TestResult,
+                            settle_time: float):
+    """
+    Test that connecting to /api/events immediately delivers a 'status'
+    and a 'lightstate' event with valid JSON payloads.
+    """
+    print(f"\n--- Test: SSE INITIAL EVENTS ---")
+
+    sse = SSEClient(f"http://{device_ip}/api/events")
+    if not sse.connect():
+        results.check("SSE initial: connect", True, False)
+        return
+
+    try:
+        # Wait for at least 2 events (status + lightstate)
+        events = sse.wait_for_events(2, timeout=settle_time + 5)
+        results.check("SSE initial: received >= 2 events", True, len(events) >= 2)
+
+        if len(events) < 2:
+            print(f"  Only received {len(events)} event(s)")
+            return
+
+        # First event should be 'status'
+        evt_name, evt_data = events[0]
+        results.check("SSE initial: first event is 'status'", "status", evt_name)
+
+        try:
+            status = json.loads(evt_data)
+            results.check("SSE initial: status has 'wifi' field",
+                          True, "wifi" in status)
+            results.check("SSE initial: status has 'zigbee' field",
+                          True, "zigbee" in status)
+            results.check("SSE initial: status has 'lightCount' field",
+                          True, "lightCount" in status)
+            results.check("SSE initial: status has 'eui64' field",
+                          True, "eui64" in status)
+            print(f"  Status: wifi={status.get('wifi')}, "
+                  f"zigbee={status.get('zigbee')}, "
+                  f"lights={status.get('lightCount')}")
+        except json.JSONDecodeError as e:
+            results.check(f"SSE initial: status is valid JSON", True, False)
+            print(f"  Bad JSON: {e}")
+
+        # Second event should be 'lightstate'
+        evt_name, evt_data = events[1]
+        results.check("SSE initial: second event is 'lightstate'",
+                      "lightstate", evt_name)
+
+        try:
+            lightstate = json.loads(evt_data)
+            results.check("SSE initial: lightstate has 'lights' array",
+                          True, "lights" in lightstate
+                          and isinstance(lightstate["lights"], list))
+            lights = lightstate.get("lights", [])
+            if lights:
+                first = lights[0]
+                results.check("SSE initial: light[0] has 'on' field",
+                              True, "on" in first)
+                results.check("SSE initial: light[0] has 'bri' field",
+                              True, "bri" in first)
+                results.check("SSE initial: light[0] has 'r' field",
+                              True, "r" in first)
+                print(f"  Light[0]: on={first.get('on')}, bri={first.get('bri')}, "
+                      f"r={first.get('r')} g={first.get('g')} "
+                      f"b={first.get('b')} w={first.get('w')}")
+        except json.JSONDecodeError as e:
+            results.check("SSE initial: lightstate is valid JSON", True, False)
+            print(f"  Bad JSON: {e}")
+    finally:
+        sse.close()
+
+
+def test_sse_concurrent_rest(device_ip: str, results: TestResult,
+                             settle_time: float):
+    """
+    Test that REST API requests succeed while an SSE connection is open.
+    This verifies the async SSE handler doesn't block httpd worker threads.
+    """
+    print(f"\n--- Test: SSE CONCURRENT REST ---")
+
+    sse = SSEClient(f"http://{device_ip}/api/events")
+    if not sse.connect():
+        results.check("SSE concurrent: connect", True, False)
+        return
+
+    try:
+        # Wait for initial events to confirm SSE is established
+        sse.wait_for_events(2, timeout=settle_time + 5)
+
+        # Now make REST API requests while SSE is open
+        print("  Testing GET /api/status while SSE connected...")
+        status = get_device_status(device_ip)
+        results.check("SSE concurrent: GET /api/status succeeded",
+                      True, status is not None)
+        if status:
+            print(f"    Status: wifi={status.get('wifi')}, "
+                  f"zigbee={status.get('zigbee')}")
+
+        print("  Testing GET /api/lights/state while SSE connected...")
+        lights = get_device_light_state(device_ip)
+        results.check("SSE concurrent: GET /api/lights/state succeeded",
+                      True, lights is not None)
+        if lights:
+            print(f"    Got {len(lights)} light state(s)")
+
+        print("  Testing GET /api/config while SSE connected...")
+        config = get_device_config(device_ip)
+        results.check("SSE concurrent: GET /api/config succeeded",
+                      True, config is not None)
+        if config:
+            print(f"    Config: {len(config.get('lights', []))} light(s)")
+
+    finally:
+        sse.close()
+
+
+def test_sse_state_change(device_ip: str, api: HueAPI, light_id: str,
+                          results: TestResult, settle_time: float):
+    """
+    Test that toggling a light via the Hue Bridge triggers an SSE
+    'lightstate' event push (beyond the initial events).
+    """
+    print(f"\n--- Test: SSE STATE CHANGE (light #{light_id}) ---")
+
+    sse = SSEClient(f"http://{device_ip}/api/events")
+    if not sse.connect():
+        results.check("SSE state change: connect", True, False)
+        return
+
+    try:
+        # Wait for initial events
+        events = sse.wait_for_events(2, timeout=settle_time + 5)
+        initial_count = sse.event_count()
+        if initial_count < 2:
+            results.check("SSE state change: initial events received", True, False)
+            return
+        print(f"  Received {initial_count} initial events")
+
+        # Toggle light OFF
+        print(f"  Turning light #{light_id} OFF via Hue API...")
+        api.set_light_state(light_id, {"on": False})
+        time.sleep(settle_time)
+
+        # Wait for a new lightstate event (beyond initial ones)
+        new_event = sse.wait_for_event_named(
+            "lightstate", min_index=initial_count, timeout=settle_time + 5)
+        results.check("SSE state change: received 'lightstate' after OFF",
+                      True, new_event is not None)
+
+        if new_event:
+            try:
+                data = json.loads(new_event)
+                lights = data.get("lights", [])
+                if lights:
+                    print(f"    Pushed light[0]: on={lights[0].get('on')}, "
+                          f"bri={lights[0].get('bri')}")
+                    results.check("SSE state change: light reports on=false",
+                                  False, lights[0].get("on"))
+            except json.JSONDecodeError:
+                results.check("SSE state change: lightstate is valid JSON",
+                              True, False)
+
+        count_after_off = sse.event_count()
+
+        # Toggle light ON
+        print(f"  Turning light #{light_id} ON via Hue API...")
+        api.set_light_state(light_id, {"on": True, "bri": 254})
+        time.sleep(settle_time)
+
+        new_event = sse.wait_for_event_named(
+            "lightstate", min_index=count_after_off, timeout=settle_time + 5)
+        results.check("SSE state change: received 'lightstate' after ON",
+                      True, new_event is not None)
+
+        if new_event:
+            try:
+                data = json.loads(new_event)
+                lights = data.get("lights", [])
+                if lights:
+                    print(f"    Pushed light[0]: on={lights[0].get('on')}, "
+                          f"bri={lights[0].get('bri')}")
+                    results.check("SSE state change: light reports on=true",
+                                  True, lights[0].get("on"))
+            except json.JSONDecodeError:
+                results.check("SSE state change: lightstate is valid JSON",
+                              True, False)
+    finally:
+        sse.close()
+
+
+def test_sse_keepalive(device_ip: str, results: TestResult):
+    """
+    Test that the SSE stream sends a keepalive comment within ~15 seconds
+    of inactivity. We wait 18s to give margin.
+    """
+    print(f"\n--- Test: SSE KEEPALIVE ---")
+    print("  (This test waits ~18 seconds for a keepalive comment)")
+
+    sse = SSEClient(f"http://{device_ip}/api/events", timeout=30)
+    if not sse.connect():
+        results.check("SSE keepalive: connect", True, False)
+        return
+
+    try:
+        # Wait for initial events
+        sse.wait_for_events(2, timeout=10)
+
+        # Clear comments collected during connect, then wait for keepalive
+        sse.clear()
+        print("  Waiting up to 18s for keepalive comment...")
+        got_keepalive = sse.wait_for_comment(timeout=18)
+        results.check("SSE keepalive: received comment within 18s",
+                      True, got_keepalive)
+
+        if got_keepalive:
+            with sse._lock:
+                print(f"    Comment: {sse.comments[0]}")
+    finally:
+        sse.close()
+
+
+def test_sse_reconnect(device_ip: str, results: TestResult,
+                       settle_time: float):
+    """
+    Test that after disconnecting and reconnecting, the SSE stream
+    delivers fresh initial events.
+    """
+    print(f"\n--- Test: SSE RECONNECT ---")
+
+    # First connection
+    sse1 = SSEClient(f"http://{device_ip}/api/events")
+    if not sse1.connect():
+        results.check("SSE reconnect: first connect", True, False)
+        return
+
+    events1 = sse1.wait_for_events(2, timeout=settle_time + 5)
+    results.check("SSE reconnect: first connection got events",
+                  True, len(events1) >= 2)
+    sse1.close()
+    print("  First connection closed")
+
+    # Brief pause to let server clean up
+    time.sleep(1)
+
+    # Second connection
+    sse2 = SSEClient(f"http://{device_ip}/api/events")
+    if not sse2.connect():
+        results.check("SSE reconnect: second connect", True, False)
+        return
+
+    try:
+        events2 = sse2.wait_for_events(2, timeout=settle_time + 5)
+        results.check("SSE reconnect: second connection got events",
+                      True, len(events2) >= 2)
+
+        if len(events2) >= 2:
+            results.check("SSE reconnect: first event is 'status'",
+                          "status", events2[0][0])
+            results.check("SSE reconnect: second event is 'lightstate'",
+                          "lightstate", events2[1][0])
+            print(f"  Second connection received {len(events2)} events")
+    finally:
+        sse2.close()
+
+
+# ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
 
@@ -1517,31 +1903,41 @@ def main():
                         help="Skip ArtNet verification, only test Hue API round-trip")
     parser.add_argument("--settle-time", type=float, default=DEFAULT_SETTLE_TIME,
                         help=f"Seconds to wait after Hue command (default: {DEFAULT_SETTLE_TIME})")
-    parser.add_argument("--test", choices=["all", "onoff", "color", "brightness", "accuracy", "colortemp", "rgbw"],
+    parser.add_argument("--test", choices=["all", "onoff", "color", "brightness", "accuracy", "colortemp", "rgbw", "sse"],
                         default="all",
                         help="Which test to run (default: all)")
 
     args = parser.parse_args()
 
     # --- Discover bridge ---
+    # SSE-only tests don't strictly need the Hue Bridge (except state change).
     bridge_ip = args.bridge_ip
     if not bridge_ip:
         bridge_ip = discover_bridge()
         if not bridge_ip:
-            print("ERROR: Could not discover Hue Bridge. Use --bridge-ip.",
-                  file=sys.stderr)
-            sys.exit(1)
-    print(f"Hue Bridge: {bridge_ip}")
+            if args.test == "sse":
+                print("WARNING: Could not discover Hue Bridge. "
+                      "SSE state-change test will be skipped.")
+            else:
+                print("ERROR: Could not discover Hue Bridge. Use --bridge-ip.",
+                      file=sys.stderr)
+                sys.exit(1)
+    if bridge_ip:
+        print(f"Hue Bridge: {bridge_ip}")
 
     # --- API key ---
     api_key = args.api_key or load_api_key()
     if not api_key:
-        print("ERROR: No Hue API key found. Run tools/hue_debug.py first "
-              "to create one.", file=sys.stderr)
-        sys.exit(1)
-    print(f"API key: {api_key[:8]}...")
+        if args.test == "sse":
+            print("WARNING: No Hue API key. SSE state-change test will be skipped.")
+        else:
+            print("ERROR: No Hue API key found. Run tools/hue_debug.py first "
+                  "to create one.", file=sys.stderr)
+            sys.exit(1)
+    if api_key:
+        print(f"API key: {api_key[:8]}...")
 
-    api = HueAPI(bridge_ip, api_key)
+    api = HueAPI(bridge_ip, api_key) if bridge_ip and api_key else None
 
     # --- Configure device and identify lights ---
     device_config = None
@@ -1582,26 +1978,27 @@ def main():
                       f"dmxAddr={lc.get('dmxAddr')} (endpoint {10 + i * 10})")
 
     # Find matching Hue lights
-    print(f"\nSearching for {DEVICE_MANUFACTURER} lights on bridge...")
-    matching = find_device_lights(api, device_eui64)
-    if matching:
-        print(f"  Found {len(matching)} matching light(s):")
-        for lid, light in sorted(matching.items(), key=lambda x: int(x[0])):
-            print(f"    Light #{lid}: {light.get('name')} "
-                  f"(uniqueid={light.get('uniqueid')})")
-        light_ids = sorted(matching.keys(), key=int)
-    elif args.light_id:
-        light_ids = [args.light_id]
-        print(f"  Using explicitly specified light ID: {args.light_id}")
-    else:
-        print("  ERROR: No matching lights found on bridge.", file=sys.stderr)
-        print("  Use --light-id to specify manually, or pair the device first.",
-              file=sys.stderr)
-        sys.exit(1)
+    if api:
+        print(f"\nSearching for {DEVICE_MANUFACTURER} lights on bridge...")
+        matching = find_device_lights(api, device_eui64)
+        if matching:
+            print(f"  Found {len(matching)} matching light(s):")
+            for lid, light in sorted(matching.items(), key=lambda x: int(x[0])):
+                print(f"    Light #{lid}: {light.get('name')} "
+                      f"(uniqueid={light.get('uniqueid')})")
+            light_ids = sorted(matching.keys(), key=int)
+        elif args.light_id:
+            light_ids = [args.light_id]
+            print(f"  Using explicitly specified light ID: {args.light_id}")
+        elif args.test != "sse":
+            print("  ERROR: No matching lights found on bridge.", file=sys.stderr)
+            print("  Use --light-id to specify manually, or pair the device first.",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    if args.light_id:
-        # Override with explicit light ID
-        light_ids = [args.light_id]
+        if args.light_id:
+            # Override with explicit light ID
+            light_ids = [args.light_id]
 
     # --- Build DMX mapping from device config ---
     # Maps hue_light_id -> (dmx_start_addr, channel_map, light_type)
@@ -1658,6 +2055,8 @@ def main():
     results = TestResult()
 
     for light_index, lid in enumerate(light_ids):
+        if not api:
+            break  # Hue bridge tests require api
         dmx_start, channel_map, light_type = dmx_mappings.get(
             lid, (1, {"r": 0, "g": 1, "b": 2}, "RGB"))
         print(f"\n{'=' * 60}")
@@ -1701,6 +2100,29 @@ def main():
         # Restore light to a neutral state
         print(f"\n  Restoring light #{lid} to white, ON, bri=254...")
         api.set_light_state(lid, {"on": True, "bri": 254, "xy": [0.3127, 0.3290]})
+
+    # --- SSE tests (device-level, not per-light) ---
+    tests_to_run = args.test
+    if tests_to_run in ("all", "sse") and args.device_ip:
+        print(f"\n{'=' * 60}")
+        print(f"  SSE (Server-Sent Events) TESTS")
+        print(f"{'=' * 60}")
+
+        test_sse_initial_events(args.device_ip, results, args.settle_time)
+        test_sse_concurrent_rest(args.device_ip, results, args.settle_time)
+        test_sse_reconnect(args.device_ip, results, args.settle_time)
+
+        # State change test needs Hue bridge + a light to toggle
+        if light_ids and api:
+            test_sse_state_change(args.device_ip, api, light_ids[0],
+                                 results, args.settle_time)
+        elif not api:
+            print("\n  SKIP: SSE state-change test (no Hue bridge/API key)")
+
+        # Keepalive test takes ~18s, run last
+        test_sse_keepalive(args.device_ip, results)
+    elif tests_to_run == "sse" and not args.device_ip:
+        print("\n  SKIP: SSE tests require --device-ip")
 
     # --- Cleanup ---
     if listener:

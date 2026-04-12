@@ -7,9 +7,11 @@
  * - REST API: GET/POST /api/config, POST /api/factory-reset
  * - WLED discovery API: GET /api/wled/discover
  * - Status API: GET /api/status
+ * - SSE event stream: GET /api/events (replaces polling for live updates)
  *
- * Uses the built-in synchronous WebServer (not ESPAsyncWebServer)
- * to avoid AsyncTCP incompatibility with ARDUINO_USB_CDC_ON_BOOT on ESP32-C6.
+ * Uses the ESP-IDF native HTTP server (esp_http_server) for async request
+ * handling and SSE support.  The server runs in its own FreeRTOS task
+ * so webLoop() no longer needs to pump handleClient().
  */
 
 #include "web_ui.h"
@@ -20,12 +22,12 @@
 
 #include <WiFi.h>
 #include <DNSServer.h>
-#include <WebServer.h>
+#include <esp_http_server.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <Update.h>
 
-static WebServer server(80);
+static httpd_handle_t httpServer = nullptr;
 static DNSServer dnsServer;
 static bool apMode = false;
 static bool serverStarted = false;
@@ -516,19 +518,124 @@ function pollStatus() {
   loadStatus().finally(() => setTimeout(pollStatus, 5000));
 }
 function pollLightStates() {
-  loadLightStates().finally(() => setTimeout(pollLightStates, 1000));
+  loadLightStates().finally(() => setTimeout(pollLightStates, 2000));
 }
 
-// Initial load - fetch both in parallel, then start polling
+// ---- SSE (Server-Sent Events) with polling fallback ----
+let evtSource = null;
+let useSSE = true;
+
+function applyStatus(s) {
+  document.getElementById('wifiStatus').textContent = s.wifi || 'Unknown';
+  document.getElementById('zbStatus').textContent = s.zigbee || 'Unknown';
+  isApMode = s.apMode || false;
+  document.getElementById('wifiSetup').style.display = isApMode ? 'block' : 'none';
+}
+
+function applyLightStates(data) {
+  const lights = data.lights || [];
+  for (let i = 0; i < lights.length; i++) {
+    const el = document.getElementById('preview-' + i);
+    if (!el) continue;
+    const l = lights[i];
+    if (l.on) {
+      const pw = l.w || 0;
+      const pr = Math.min(255, l.r + pw);
+      const pg = Math.min(255, l.g + pw);
+      const pb = Math.min(255, l.b + pw);
+      el.style.background = 'rgb(' + pr + ',' + pg + ',' + pb + ')';
+      el.style.boxShadow = '0 0 8px rgba(' + pr + ',' + pg + ',' + pb + ',0.5)';
+    } else {
+      el.style.background = '#111';
+      el.style.boxShadow = 'none';
+    }
+  }
+}
+
+function startSSE() {
+  if (evtSource) { evtSource.close(); evtSource = null; }
+
+  evtSource = new EventSource('/api/events');
+
+  evtSource.addEventListener('status', function(e) {
+    try { applyStatus(JSON.parse(e.data)); } catch(err) {}
+  });
+
+  evtSource.addEventListener('lightstate', function(e) {
+    try { applyLightStates(JSON.parse(e.data)); } catch(err) {}
+  });
+
+  evtSource.onerror = function() {
+    // EventSource auto-reconnects, but if it keeps failing fall back to polling
+    if (evtSource.readyState === EventSource.CLOSED) {
+      console.warn('SSE closed, falling back to polling');
+      useSSE = false;
+      evtSource.close();
+      evtSource = null;
+      setTimeout(pollStatus, 5000);
+      setTimeout(pollLightStates, 2000);
+    }
+  };
+}
+
+// Initial load - fetch config and status, then start SSE
 Promise.all([loadStatus(), loadConfig()]).then(() => {
   document.getElementById('loadingState')?.remove();
-  setTimeout(pollStatus, 5000);
-  setTimeout(pollLightStates, 1000);
+  if (useSSE) {
+    startSSE();
+  } else {
+    setTimeout(pollStatus, 5000);
+    setTimeout(pollLightStates, 2000);
+  }
 });
 </script>
 </body>
 </html>
 )rawliteral";
+
+// ---- Helper: read full POST body from esp_http_server request ----
+static String readRequestBody(httpd_req_t *req) {
+  int contentLen = req->content_len;
+  if (contentLen <= 0) return String();
+
+  // Cap to a reasonable size to avoid OOM
+  if (contentLen > 4096) contentLen = 4096;
+
+  String body;
+  body.reserve(contentLen);
+  char buf[256];
+  int remaining = contentLen;
+
+  while (remaining > 0) {
+    int toRead = (remaining < (int)sizeof(buf)) ? remaining : (int)sizeof(buf);
+    int ret = httpd_req_recv(req, buf, toRead);
+    if (ret <= 0) {
+      if (ret == HTTPD_SOCK_ERR_TIMEOUT) continue;  // retry on timeout
+      break;
+    }
+    body.concat(buf, ret);
+    remaining -= ret;
+  }
+  return body;
+}
+
+// ---- Helper: send JSON string as response ----
+static esp_err_t sendJson(httpd_req_t *req, const String& json) {
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, json.c_str(), json.length());
+}
+
+// ---- Helper: send a short JSON error ----
+static esp_err_t sendJsonError(httpd_req_t *req, int status, const char* msg) {
+  char statusStr[8];
+  snprintf(statusStr, sizeof(statusStr), "%d", status);
+  httpd_resp_set_status(req, status == 400 ? "400 Bad Request" : "500 Internal Server Error");
+  httpd_resp_set_type(req, "application/json");
+  String body = "{\"error\":\"";
+  body += msg;
+  body += "\"}";
+  return httpd_resp_send(req, body.c_str(), body.length());
+}
 
 // ---- Helper: load WiFi creds from NVS ----
 static void loadWifiCreds() {
@@ -550,222 +657,703 @@ static void saveWifiCreds(const String& ssid, const String& pass) {
   p.end();
 }
 
+// ---- Route handlers ----
+
+// GET / — Serve the main page
+static esp_err_t handleRoot(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
+}
+
+// GET /api/status
+static esp_err_t handleStatus(httpd_req_t *req) {
+  JsonDocument doc;
+  doc["wifi"] = WiFi.isConnected() ? WiFi.SSID() : "Not connected";
+  doc["apMode"] = apMode;
+  doc["zigbee"] = !zigbeeIsEnabled() ? "Disabled - no lights configured"
+                 : zigbeeIsPaired() ? "Paired"
+                 : "Searching...";
+  doc["eui64"] = zigbeeGetEUI64();
+  doc["lightCount"] = configStore.getLightCount();
+
+  String json;
+  serializeJson(doc, json);
+  return sendJson(req, json);
+}
+
+// GET /api/lights/state
+static esp_err_t handleLightState(httpd_req_t *req) {
+  JsonDocument doc;
+  JsonArray arr = doc["lights"].to<JsonArray>();
+  uint8_t count = configStore.getLightCount();
+  for (uint8_t i = 0; i < count; i++) {
+    const LightState& st = zigbeeGetLightState(i);
+    JsonObject obj = arr.add<JsonObject>();
+    obj["on"] = st.powerOn;
+    obj["bri"] = st.brightness;
+    float briScale = st.powerOn ? (static_cast<float>(st.brightness) / 254.0f) : 0.0f;
+    obj["r"] = static_cast<uint8_t>(st.red * briScale);
+    obj["g"] = static_cast<uint8_t>(st.green * briScale);
+    obj["b"] = static_cast<uint8_t>(st.blue * briScale);
+    obj["w"] = static_cast<uint8_t>(st.white * briScale);
+  }
+  String json;
+  serializeJson(doc, json);
+  return sendJson(req, json);
+}
+
+// GET /api/wled/discover
+static esp_err_t handleWledDiscover(httpd_req_t *req) {
+  std::vector<WledDeviceInfo> devices;
+  wledDiscover(devices);
+
+  JsonDocument doc;
+  JsonArray arr = doc["devices"].to<JsonArray>();
+  for (const auto& dev : devices) {
+    JsonObject obj = arr.add<JsonObject>();
+    obj["name"] = dev.name;
+    obj["host"] = dev.host;
+    obj["hostname"] = dev.hostname;
+    obj["port"] = dev.port;
+    obj["mac"] = dev.mac;
+    obj["ledCount"] = dev.ledCount;
+    obj["isRGBW"] = dev.isRGBW;
+    obj["version"] = dev.version;
+  }
+
+  String json;
+  serializeJson(doc, json);
+  return sendJson(req, json);
+}
+
+// GET /api/config
+static esp_err_t handleConfigGet(httpd_req_t *req) {
+  JsonDocument doc;
+  configStore.toJson(doc);
+
+  String json;
+  serializeJson(doc, json);
+  return sendJson(req, json);
+}
+
+// POST /api/config
+static esp_err_t handleConfigPost(httpd_req_t *req) {
+  String body = readRequestBody(req);
+  if (body.length() == 0) {
+    return sendJsonError(req, 400, "No body");
+  }
+
+  ESP_LOGI("Web", "POST /api/config body (%d bytes): %s", body.length(), body.c_str());
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+
+  if (err) {
+    ESP_LOGE("Web", "JSON parse error: %s", err.c_str());
+    String resp = "{\"error\":\"Invalid JSON: ";
+    resp += err.c_str();
+    resp += "\"}";
+    httpd_resp_set_status(req, "400 Bad Request");
+    return sendJson(req, resp);
+  }
+
+  if (configStore.fromJson(doc)) {
+    configStore.save();
+    ESP_LOGI("Web", "Config saved: %d lights", configStore.getLightCount());
+    zigbeeReconfigure();
+    return sendJson(req, "{\"ok\":true}");
+  } else {
+    ESP_LOGE("Web", "fromJson failed - doc contents:");
+    String docStr;
+    serializeJson(doc, docStr);
+    ESP_LOGE("Web", "  parsed doc: %s", docStr.c_str());
+    return sendJsonError(req, 400, "Invalid config - 'lights' array not found");
+  }
+}
+
+// POST /api/wifi
+static esp_err_t handleWifiPost(httpd_req_t *req) {
+  String body = readRequestBody(req);
+  if (body.length() == 0) {
+    return sendJsonError(req, 400, "No body");
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+
+  if (err) {
+    return sendJsonError(req, 400, "Invalid JSON");
+  }
+
+  String ssid = doc["ssid"] | "";
+  String pass = doc["password"] | "";
+
+  if (ssid.length() == 0) {
+    return sendJsonError(req, 400, "SSID required");
+  }
+
+  saveWifiCreds(ssid, pass);
+  sendJson(req, "{\"ok\":true}");
+
+  // Restart after a short delay to let the response be sent
+  delay(1000);
+  ESP.restart();
+  return ESP_OK;
+}
+
+// POST /api/factory-reset
+static esp_err_t handleFactoryReset(httpd_req_t *req) {
+  configStore.factoryReset();
+
+  // Also clear WiFi credentials
+  Preferences p;
+  p.begin("zbwled_wifi", false);
+  p.clear();
+  p.end();
+
+  sendJson(req, "{\"ok\":true}");
+
+  delay(1000);
+  ESP.restart();
+  return ESP_OK;
+}
+
+// POST /api/restart
+static esp_err_t handleRestart(httpd_req_t *req) {
+  sendJson(req, "{\"ok\":true}");
+  delay(1000);
+  ESP.restart();
+  return ESP_OK;
+}
+
+// POST /api/ota — multipart firmware upload
+static esp_err_t handleOta(httpd_req_t *req) {
+  int contentLen = req->content_len;
+  if (contentLen <= 0) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_send(req, "No content", HTTPD_RESP_USE_STRLEN);
+  }
+
+  ESP_LOGI("OTA", "OTA upload start (%d bytes)", contentLen);
+  wledOutput.stop();
+
+  // Extract multipart boundary from Content-Type header
+  char contentType[128] = {0};
+  if (httpd_req_get_hdr_value_str(req, "Content-Type", contentType, sizeof(contentType)) != ESP_OK) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_send(req, "Missing Content-Type", HTTPD_RESP_USE_STRLEN);
+  }
+
+  char *boundaryPtr = strstr(contentType, "boundary=");
+  if (!boundaryPtr) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_send(req, "Missing boundary", HTTPD_RESP_USE_STRLEN);
+  }
+  boundaryPtr += 9;  // skip "boundary="
+
+  // Build the full boundary markers
+  String boundary = String("--") + boundaryPtr;
+  String endBoundary = boundary + "--";
+
+  // We'll stream the request body, stripping multipart framing, and feed
+  // the raw binary to Update.  Strategy: read all data, skip headers up to
+  // the first blank line after the first boundary, then feed until the final
+  // boundary.
+
+  // State machine for multipart parsing
+  enum ParseState { SEEK_HEADER_END, WRITING, DONE };
+  ParseState state = SEEK_HEADER_END;
+
+  if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+    ESP_LOGE("OTA", "Update.begin failed: %s", Update.errorString());
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "Update.begin failed", HTTPD_RESP_USE_STRLEN);
+  }
+
+  // Accumulator for finding header end and boundary markers
+  String accum;
+  accum.reserve(512);
+
+  char buf[1024];
+  int remaining = contentLen;
+  bool updateOk = true;
+
+  while (remaining > 0) {
+    int toRead = (remaining < (int)sizeof(buf)) ? remaining : (int)sizeof(buf);
+    int ret = httpd_req_recv(req, buf, toRead);
+    if (ret <= 0) {
+      if (ret == HTTPD_SOCK_ERR_TIMEOUT) continue;
+      ESP_LOGE("OTA", "Receive error: %d", ret);
+      updateOk = false;
+      break;
+    }
+    remaining -= ret;
+
+    if (state == SEEK_HEADER_END) {
+      // Accumulate until we find the blank line after MIME headers (\r\n\r\n)
+      accum.concat(buf, ret);
+      int headerEnd = accum.indexOf("\r\n\r\n");
+      if (headerEnd >= 0) {
+        // Everything after \r\n\r\n is firmware data
+        int dataStart = headerEnd + 4;
+        int dataLen = accum.length() - dataStart;
+        if (dataLen > 0) {
+          // Check if the end boundary is within this chunk
+          int endIdx = accum.indexOf(endBoundary, dataStart);
+          if (endIdx >= 0) {
+            dataLen = endIdx - dataStart;
+            // Strip trailing \r\n before boundary
+            if (dataLen >= 2 && accum[dataStart + dataLen - 2] == '\r' && accum[dataStart + dataLen - 1] == '\n') {
+              dataLen -= 2;
+            }
+            if (dataLen > 0) {
+              Update.write((uint8_t*)accum.c_str() + dataStart, dataLen);
+            }
+            state = DONE;
+          } else {
+            Update.write((uint8_t*)accum.c_str() + dataStart, dataLen);
+            state = WRITING;
+          }
+        } else {
+          state = WRITING;
+        }
+        accum = "";  // free memory
+      }
+    } else if (state == WRITING) {
+      // Check if this chunk contains the end boundary
+      // We need to be careful about boundaries spanning chunks, so we buffer
+      // enough overlap.  The boundary is relatively short compared to chunks.
+      accum.concat(buf, ret);
+
+      int endIdx = accum.indexOf(endBoundary);
+      if (endIdx >= 0) {
+        // Write everything up to (but not including) the boundary
+        int dataLen = endIdx;
+        // Strip trailing \r\n before boundary
+        if (dataLen >= 2 && accum[dataLen - 2] == '\r' && accum[dataLen - 1] == '\n') {
+          dataLen -= 2;
+        }
+        if (dataLen > 0) {
+          if (Update.write((uint8_t*)accum.c_str(), dataLen) != (size_t)dataLen) {
+            ESP_LOGE("OTA", "Update.write failed: %s", Update.errorString());
+            updateOk = false;
+          }
+        }
+        state = DONE;
+        accum = "";
+      } else {
+        // Write all but the last (boundary.length + 4) bytes to handle
+        // boundaries that span chunk edges
+        int safe = accum.length() - (boundary.length() + 4);
+        if (safe > 0) {
+          if (Update.write((uint8_t*)accum.c_str(), safe) != (size_t)safe) {
+            ESP_LOGE("OTA", "Update.write failed: %s", Update.errorString());
+            updateOk = false;
+            break;
+          }
+          accum.remove(0, safe);
+        }
+      }
+    }
+    // state == DONE: just drain remaining bytes
+  }
+
+  // If we ended in WRITING state (no end boundary found), flush remaining data
+  // minus any trailing boundary content
+  if (state == WRITING && accum.length() > 0) {
+    int endIdx = accum.indexOf(boundary);
+    int dataLen = (endIdx >= 0) ? endIdx : accum.length();
+    // Strip trailing \r\n
+    if (dataLen >= 2 && accum[dataLen - 2] == '\r' && accum[dataLen - 1] == '\n') {
+      dataLen -= 2;
+    }
+    if (dataLen > 0) {
+      if (Update.write((uint8_t*)accum.c_str(), dataLen) != (size_t)dataLen) {
+        ESP_LOGE("OTA", "Update.write failed: %s", Update.errorString());
+        updateOk = false;
+      }
+    }
+  }
+
+  if (updateOk && Update.end(true)) {
+    ESP_LOGI("OTA", "OTA upload complete");
+    httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+    delay(1000);
+    ESP.restart();
+  } else {
+    ESP_LOGE("OTA", "Update.end failed: %s", Update.errorString());
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_send(req, "OTA update failed", HTTPD_RESP_USE_STRLEN);
+  }
+
+  return ESP_OK;
+}
+
+// ---- SSE (Server-Sent Events) — async push from webLoop() ----
+//
+// The SSE handler sends HTTP headers + initial state, then stores the
+// socket fd and async request handle.  webLoop() periodically checks
+// for state changes and pushes events via httpd_socket_send().  This
+// avoids blocking an httpd worker thread for the SSE connection lifetime.
+//
+// Only one SSE client is supported at a time (typical for a config UI).
+// If a new client connects, the old one is closed.
+
+// Snapshot of status fields for change detection
+struct StatusSnapshot {
+  bool     connected;
+  bool     apMode;
+  bool     zigbeeEnabled;
+  bool     zigbeePaired;
+  uint8_t  lightCount;
+};
+
+// Compact light state snapshot for change detection (avoids full JSON compare)
+struct LightSnapshot {
+  bool    powerOn;
+  uint8_t brightness;
+  uint8_t r, g, b, w;
+};
+
+// SSE client state
+static int         sseFd       = -1;   // socket fd, -1 = no client
+static httpd_req_t *sseAsyncReq = nullptr;
+
+// Snapshots for change detection (updated from webLoop)
+static StatusSnapshot sseLastStatus = {};
+static LightSnapshot  sseLastLights[MAX_LIGHTS] = {};
+static uint8_t        sseLastCount = 0;
+static unsigned long   sseLastKeepalive = 0;
+
+// Build a status SSE data payload (same fields as GET /api/status)
+static String buildStatusJson() {
+  JsonDocument doc;
+  doc["wifi"] = WiFi.isConnected() ? WiFi.SSID() : "Not connected";
+  doc["apMode"] = apMode;
+  doc["zigbee"] = !zigbeeIsEnabled() ? "Disabled - no lights configured"
+                 : zigbeeIsPaired() ? "Paired"
+                 : "Searching...";
+  doc["eui64"] = zigbeeGetEUI64();
+  doc["lightCount"] = configStore.getLightCount();
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+
+// Build a lightstate SSE data payload (same fields as GET /api/lights/state)
+static String buildLightStateJson() {
+  JsonDocument doc;
+  JsonArray arr = doc["lights"].to<JsonArray>();
+  uint8_t count = configStore.getLightCount();
+  for (uint8_t i = 0; i < count; i++) {
+    const LightState& st = zigbeeGetLightState(i);
+    JsonObject obj = arr.add<JsonObject>();
+    obj["on"] = st.powerOn;
+    obj["bri"] = st.brightness;
+    float briScale = st.powerOn ? (static_cast<float>(st.brightness) / 254.0f) : 0.0f;
+    obj["r"] = static_cast<uint8_t>(st.red * briScale);
+    obj["g"] = static_cast<uint8_t>(st.green * briScale);
+    obj["b"] = static_cast<uint8_t>(st.blue * briScale);
+    obj["w"] = static_cast<uint8_t>(st.white * briScale);
+  }
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+
+// Take a snapshot of current status for change detection
+static StatusSnapshot takeStatusSnapshot() {
+  StatusSnapshot s;
+  s.connected     = WiFi.isConnected();
+  s.apMode        = apMode;
+  s.zigbeeEnabled = zigbeeIsEnabled();
+  s.zigbeePaired  = zigbeeIsPaired();
+  s.lightCount    = configStore.getLightCount();
+  return s;
+}
+
+static bool statusChanged(const StatusSnapshot& a, const StatusSnapshot& b) {
+  return a.connected != b.connected
+      || a.apMode != b.apMode
+      || a.zigbeeEnabled != b.zigbeeEnabled
+      || a.zigbeePaired != b.zigbeePaired
+      || a.lightCount != b.lightCount;
+}
+
+static void takeLightSnapshot(LightSnapshot* out, uint8_t count) {
+  for (uint8_t i = 0; i < count; i++) {
+    const LightState& st = zigbeeGetLightState(i);
+    float briScale = st.powerOn ? (static_cast<float>(st.brightness) / 254.0f) : 0.0f;
+    out[i].powerOn    = st.powerOn;
+    out[i].brightness = st.brightness;
+    out[i].r = static_cast<uint8_t>(st.red * briScale);
+    out[i].g = static_cast<uint8_t>(st.green * briScale);
+    out[i].b = static_cast<uint8_t>(st.blue * briScale);
+    out[i].w = static_cast<uint8_t>(st.white * briScale);
+  }
+}
+
+static bool lightsChanged(const LightSnapshot* a, const LightSnapshot* b, uint8_t count) {
+  return memcmp(a, b, count * sizeof(LightSnapshot)) != 0;
+}
+
+// Close the current SSE client and release async request
+static void sseCloseClient() {
+  if (sseFd >= 0 && httpServer) {
+    httpd_sess_trigger_close(httpServer, sseFd);
+  }
+  if (sseAsyncReq) {
+    httpd_req_async_handler_complete(sseAsyncReq);
+    sseAsyncReq = nullptr;
+  }
+  sseFd = -1;
+}
+
+// Send raw SSE-formatted data on the stored socket.
+// Returns true on success, false on failure (client gone).
+static bool sseSendRaw(const char* buf, size_t len) {
+  if (sseFd < 0 || !httpServer) return false;
+  // httpd_socket_send returns bytes sent, or <0 on error
+  int sent = httpd_socket_send(httpServer, sseFd, buf, len, 0);
+  return (sent >= 0 && (size_t)sent == len);
+}
+
+static bool sseSendEvent(const char* event, const String& data) {
+  String msg = "event: ";
+  msg += event;
+  msg += "\ndata: ";
+  msg += data;
+  msg += "\n\n";
+  return sseSendRaw(msg.c_str(), msg.length());
+}
+
+// Global session close callback — registered in httpd_config_t.close_fn.
+// Called for EVERY session close, so we check if it's our SSE client.
+// IMPORTANT: when close_fn is set, the server does NOT close the socket
+// itself — we must call close(sockfd).
+static void sseSessionCloseCb(httpd_handle_t hd, int sockfd) {
+  if (sockfd == sseFd) {
+    ESP_LOGI("Web", "SSE client disconnected (fd %d)", sockfd);
+    if (sseAsyncReq) {
+      httpd_req_async_handler_complete(sseAsyncReq);
+      sseAsyncReq = nullptr;
+    }
+    sseFd = -1;
+  }
+  close(sockfd);
+}
+
+// GET /api/events — SSE event stream
+// Sends HTTP headers + initial events, stores socket for async push, returns.
+static esp_err_t handleEvents(httpd_req_t *req) {
+  // If there's already an SSE client, close the old one
+  if (sseFd >= 0) {
+    ESP_LOGW("Web", "Replacing existing SSE client (fd %d)", sseFd);
+    sseCloseClient();
+  }
+
+  // Set SSE headers and send the initial response line + headers via chunked encoding
+  httpd_resp_set_type(req, "text/event-stream");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+  httpd_resp_set_hdr(req, "Connection", "keep-alive");
+
+  // Send initial state as the first chunks
+  String statusEvt = "event: status\ndata: " + buildStatusJson() + "\n\n";
+  String lightEvt  = "event: lightstate\ndata: " + buildLightStateJson() + "\n\n";
+  String initial = statusEvt + lightEvt;
+
+  esp_err_t ret = httpd_resp_send_chunk(req, initial.c_str(), initial.length());
+  if (ret != ESP_OK) {
+    ESP_LOGW("Web", "SSE client disconnected during initial send");
+    httpd_resp_send_chunk(req, nullptr, 0);  // end chunked
+    return ESP_OK;
+  }
+
+  // Get the socket fd and create an async request copy
+  int fd = httpd_req_to_sockfd(req);
+  httpd_req_t *asyncReq = nullptr;
+  ret = httpd_req_async_handler_begin(req, &asyncReq);
+  if (ret != ESP_OK) {
+    ESP_LOGE("Web", "Failed to begin async handler: %s", esp_err_to_name(ret));
+    httpd_resp_send_chunk(req, nullptr, 0);
+    return ESP_OK;
+  }
+
+  // Session close detection is handled by the global close_fn callback
+  // (sseSessionCloseCb) registered in httpd_config_t.
+
+  // Store the SSE client state
+  sseFd       = fd;
+  sseAsyncReq = asyncReq;
+  sseLastStatus = takeStatusSnapshot();
+  sseLastCount = configStore.getLightCount();
+  takeLightSnapshot(sseLastLights, sseLastCount);
+  sseLastKeepalive = millis();
+
+  ESP_LOGI("Web", "SSE client connected (fd %d)", fd);
+  return ESP_OK;
+}
+
+// Called from webLoop() to push SSE events when state changes
+static void ssePollAndPush() {
+  if (sseFd < 0) return;
+
+  bool changed = false;
+
+  // Check status changes
+  StatusSnapshot curStatus = takeStatusSnapshot();
+  if (statusChanged(sseLastStatus, curStatus)) {
+    sseLastStatus = curStatus;
+    if (!sseSendEvent("status", buildStatusJson())) {
+      ESP_LOGW("Web", "SSE send failed (status), closing");
+      sseCloseClient();
+      return;
+    }
+    changed = true;
+  }
+
+  // Check light state changes
+  uint8_t curCount = configStore.getLightCount();
+  LightSnapshot curLights[MAX_LIGHTS] = {};
+  takeLightSnapshot(curLights, curCount);
+
+  if (curCount != sseLastCount || lightsChanged(sseLastLights, curLights, curCount)) {
+    sseLastCount = curCount;
+    memcpy(sseLastLights, curLights, sizeof(sseLastLights));
+    if (!sseSendEvent("lightstate", buildLightStateJson())) {
+      ESP_LOGW("Web", "SSE send failed (lightstate), closing");
+      sseCloseClient();
+      return;
+    }
+    changed = true;
+  }
+
+  // Keepalive every ~15 seconds if no events were sent
+  if (!changed && millis() - sseLastKeepalive >= 15000) {
+    sseLastKeepalive = millis();
+    if (!sseSendRaw(": keepalive\n\n", 13)) {
+      ESP_LOGW("Web", "SSE keepalive failed, closing");
+      sseCloseClient();
+      return;
+    }
+  }
+
+  if (changed) {
+    sseLastKeepalive = millis();
+  }
+}
+
+// Catch-all handler for captive portal redirect / 404
+static esp_err_t handleNotFound(httpd_req_t *req) {
+  if (apMode) {
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    return httpd_resp_send(req, "Redirecting to captive portal", HTTPD_RESP_USE_STRLEN);
+  }
+  httpd_resp_set_status(req, "404 Not Found");
+  return httpd_resp_send(req, "Not found", HTTPD_RESP_USE_STRLEN);
+}
+
 // ---- Setup API routes ----
 static void setupRoutes() {
-  // Serve the main page
-  server.on("/", HTTP_GET, []() {
-    server.send_P(200, "text/html", INDEX_HTML);
-  });
+  // GET /
+  static const httpd_uri_t rootUri = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = handleRoot,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &rootUri);
 
-  // Status API
-  server.on("/api/status", HTTP_GET, []() {
-    JsonDocument doc;
-    doc["wifi"] = WiFi.isConnected() ? WiFi.SSID() : "Not connected";
-    doc["apMode"] = apMode;
-    doc["zigbee"] = !zigbeeIsEnabled() ? "Disabled - no lights configured"
-                   : zigbeeIsPaired() ? "Paired"
-                   : "Searching...";
-    doc["eui64"] = zigbeeGetEUI64();
-    doc["lightCount"] = configStore.getLightCount();
+  // GET /api/status
+  static const httpd_uri_t statusUri = {
+    .uri       = "/api/status",
+    .method    = HTTP_GET,
+    .handler   = handleStatus,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &statusUri);
 
-    String json;
-    serializeJson(doc, json);
-    server.send(200, "application/json", json);
-  });
+  // GET /api/lights/state
+  static const httpd_uri_t lightStateUri = {
+    .uri       = "/api/lights/state",
+    .method    = HTTP_GET,
+    .handler   = handleLightState,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &lightStateUri);
 
-  // Light states API - returns current RGB output per light
-  server.on("/api/lights/state", HTTP_GET, []() {
-    JsonDocument doc;
-    JsonArray arr = doc["lights"].to<JsonArray>();
-    uint8_t count = configStore.getLightCount();
-    for (uint8_t i = 0; i < count; i++) {
-      const LightState& st = zigbeeGetLightState(i);
-      JsonObject obj = arr.add<JsonObject>();
-      obj["on"] = st.powerOn;
-      obj["bri"] = st.brightness;
-      float briScale = st.powerOn ? (static_cast<float>(st.brightness) / 254.0f) : 0.0f;
-      obj["r"] = static_cast<uint8_t>(st.red * briScale);
-      obj["g"] = static_cast<uint8_t>(st.green * briScale);
-      obj["b"] = static_cast<uint8_t>(st.blue * briScale);
-      obj["w"] = static_cast<uint8_t>(st.white * briScale);
-    }
-    String json;
-    serializeJson(doc, json);
-    server.send(200, "application/json", json);
-  });
+  // GET /api/wled/discover
+  static const httpd_uri_t discoverUri = {
+    .uri       = "/api/wled/discover",
+    .method    = HTTP_GET,
+    .handler   = handleWledDiscover,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &discoverUri);
 
-  // WLED device discovery API
-  server.on("/api/wled/discover", HTTP_GET, []() {
-    std::vector<WledDeviceInfo> devices;
-    wledDiscover(devices);
+  // GET /api/config
+  static const httpd_uri_t configGetUri = {
+    .uri       = "/api/config",
+    .method    = HTTP_GET,
+    .handler   = handleConfigGet,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &configGetUri);
 
-    JsonDocument doc;
-    JsonArray arr = doc["devices"].to<JsonArray>();
-    for (const auto& dev : devices) {
-      JsonObject obj = arr.add<JsonObject>();
-      obj["name"] = dev.name;
-      obj["host"] = dev.host;
-      obj["hostname"] = dev.hostname;
-      obj["port"] = dev.port;
-      obj["mac"] = dev.mac;
-      obj["ledCount"] = dev.ledCount;
-      obj["isRGBW"] = dev.isRGBW;
-      obj["version"] = dev.version;
-    }
+  // POST /api/config
+  static const httpd_uri_t configPostUri = {
+    .uri       = "/api/config",
+    .method    = HTTP_POST,
+    .handler   = handleConfigPost,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &configPostUri);
 
-    String json;
-    serializeJson(doc, json);
-    server.send(200, "application/json", json);
-  });
+  // POST /api/wifi
+  static const httpd_uri_t wifiPostUri = {
+    .uri       = "/api/wifi",
+    .method    = HTTP_POST,
+    .handler   = handleWifiPost,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &wifiPostUri);
 
-  // Config API - GET
-  server.on("/api/config", HTTP_GET, []() {
-    JsonDocument doc;
-    configStore.toJson(doc);
+  // POST /api/factory-reset
+  static const httpd_uri_t factoryResetUri = {
+    .uri       = "/api/factory-reset",
+    .method    = HTTP_POST,
+    .handler   = handleFactoryReset,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &factoryResetUri);
 
-    String json;
-    serializeJson(doc, json);
-    server.send(200, "application/json", json);
-  });
+  // POST /api/restart
+  static const httpd_uri_t restartUri = {
+    .uri       = "/api/restart",
+    .method    = HTTP_POST,
+    .handler   = handleRestart,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &restartUri);
 
-  // Config API - POST
-  server.on("/api/config", HTTP_POST, []() {
-    if (!server.hasArg("plain")) {
-      server.send(400, "application/json", "{\"error\":\"No body\"}");
-      return;
-    }
+  // POST /api/ota
+  static const httpd_uri_t otaUri = {
+    .uri       = "/api/ota",
+    .method    = HTTP_POST,
+    .handler   = handleOta,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &otaUri);
 
-    String body = server.arg("plain");
-    ESP_LOGI("Web", "POST /api/config body (%d bytes): %s", body.length(), body.c_str());
-
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, body);
-
-    if (err) {
-      ESP_LOGE("Web", "JSON parse error: %s", err.c_str());
-      String resp = "{\"error\":\"Invalid JSON: ";
-      resp += err.c_str();
-      resp += "\"}";
-      server.send(400, "application/json", resp);
-      return;
-    }
-
-    if (configStore.fromJson(doc)) {
-      configStore.save();
-      ESP_LOGI("Web", "Config saved: %d lights", configStore.getLightCount());
-      // Signal Zigbee to reconfigure endpoints
-      zigbeeReconfigure();
-      server.send(200, "application/json", "{\"ok\":true}");
-    } else {
-      ESP_LOGE("Web", "fromJson failed - doc contents:");
-      String docStr;
-      serializeJson(doc, docStr);
-      ESP_LOGE("Web", "  parsed doc: %s", docStr.c_str());
-      server.send(400, "application/json", "{\"error\":\"Invalid config - 'lights' array not found\"}");
-    }
-  });
-
-  // WiFi API - POST
-  server.on("/api/wifi", HTTP_POST, []() {
-    if (!server.hasArg("plain")) {
-      server.send(400, "application/json", "{\"error\":\"No body\"}");
-      return;
-    }
-
-    String body = server.arg("plain");
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, body);
-
-    if (err) {
-      server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-      return;
-    }
-
-    String ssid = doc["ssid"] | "";
-    String pass = doc["password"] | "";
-
-    if (ssid.length() == 0) {
-      server.send(400, "application/json", "{\"error\":\"SSID required\"}");
-      return;
-    }
-
-    saveWifiCreds(ssid, pass);
-    server.send(200, "application/json", "{\"ok\":true}");
-
-    // Restart after a short delay to let the response be sent
-    delay(1000);
-    ESP.restart();
-  });
-
-  // Factory reset API
-  server.on("/api/factory-reset", HTTP_POST, []() {
-    configStore.factoryReset();
-
-    // Also clear WiFi credentials
-    Preferences p;
-    p.begin("zbwled_wifi", false);
-    p.clear();
-    p.end();
-
-    server.send(200, "application/json", "{\"ok\":true}");
-
-    delay(1000);
-    ESP.restart();
-  });
-
-  // Restart API
-  server.on("/api/restart", HTTP_POST, []() {
-    server.send(200, "application/json", "{\"ok\":true}");
-    delay(1000);
-    ESP.restart();
-  });
-
-  // OTA firmware update endpoint
-  server.on("/api/ota", HTTP_POST,
-    // Response handler (called after upload completes)
-    []() {
-      if (Update.hasError()) {
-        server.send(500, "text/plain", "OTA update failed");
-      } else {
-        server.send(200, "text/plain", "OK");
-        delay(1000);
-        ESP.restart();
-      }
-    },
-    // Upload handler (called for each chunk)
-    []() {
-      HTTPUpload& upload = server.upload();
-
-      if (upload.status == UPLOAD_FILE_START) {
-        ESP_LOGI("OTA", "OTA upload start: %s (%u bytes)", upload.filename.c_str(), upload.totalSize);
-        wledOutput.stop();
-
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-          ESP_LOGE("OTA", "Update.begin failed: %s", Update.errorString());
-        }
-      } else if (upload.status == UPLOAD_FILE_WRITE) {
-        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-          ESP_LOGE("OTA", "Update.write failed: %s", Update.errorString());
-        }
-      } else if (upload.status == UPLOAD_FILE_END) {
-        if (Update.end(true)) {
-          ESP_LOGI("OTA", "OTA upload complete: %u bytes", upload.totalSize);
-        } else {
-          ESP_LOGE("OTA", "Update.end failed: %s", Update.errorString());
-        }
-      }
-    }
-  );
-
-  // Captive portal redirect - catch all requests and redirect to config page
-  server.onNotFound([]() {
-    if (apMode) {
-      server.sendHeader("Location", "http://192.168.4.1/");
-      server.send(302, "text/plain", "Redirecting to captive portal");
-    } else {
-      server.send(404, "text/plain", "Not found");
-    }
-  });
+  // GET /api/events — SSE event stream
+  static const httpd_uri_t eventsUri = {
+    .uri       = "/api/events",
+    .method    = HTTP_GET,
+    .handler   = handleEvents,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &eventsUri);
 }
 
 // ---- Public functions ----
@@ -811,11 +1399,46 @@ void webSetup() {
     dnsServer.start(53, "*", WiFi.softAPIP());
   }
 
-  setupRoutes();
-  server.begin();
-  serverStarted = true;
+  // Configure and start the ESP-IDF HTTP server
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.max_uri_handlers = 14;
+  config.stack_size = 8192;
+  config.uri_match_fn = httpd_uri_match_wildcard;
+  config.lru_purge_enable = true;
+  // Increase recv timeout slightly for large OTA uploads
+  config.recv_wait_timeout = 30;
+  // Generous send timeout for SSE keepalive on congested coexistence link
+  config.send_wait_timeout = 30;
+  // Global session close callback for SSE client disconnect detection.
+  // Note: when close_fn is set, we are responsible for calling close(sockfd).
+  config.close_fn = sseSessionCloseCb;
 
-  ESP_LOGI("Web", "Web server started%s", apMode ? " (AP mode with captive portal)" : "");
+  esp_err_t err = httpd_start(&httpServer, &config);
+  if (err == ESP_OK) {
+    setupRoutes();
+
+    // Register catch-all wildcard handler last (matches everything not matched above)
+    static const httpd_uri_t catchAllGet = {
+      .uri       = "/*",
+      .method    = HTTP_GET,
+      .handler   = handleNotFound,
+      .user_ctx  = nullptr
+    };
+    httpd_register_uri_handler(httpServer, &catchAllGet);
+
+    static const httpd_uri_t catchAllPost = {
+      .uri       = "/*",
+      .method    = HTTP_POST,
+      .handler   = handleNotFound,
+      .user_ctx  = nullptr
+    };
+    httpd_register_uri_handler(httpServer, &catchAllPost);
+
+    serverStarted = true;
+    ESP_LOGI("Web", "HTTP server started%s", apMode ? " (AP mode with captive portal)" : "");
+  } else {
+    ESP_LOGE("Web", "Failed to start HTTP server: %s", esp_err_to_name(err));
+  }
 }
 
 void webLoop() {
@@ -823,8 +1446,10 @@ void webLoop() {
     dnsServer.processNextRequest();
   }
 
-  // Process incoming HTTP requests
-  server.handleClient();
+  // The ESP-IDF HTTP server runs in its own task, so no handleClient() needed.
+
+  // Push SSE events if state changed
+  ssePollAndPush();
 
   // Check if WiFi reconnected (was in AP+STA mode)
   static bool wasConnected = false;

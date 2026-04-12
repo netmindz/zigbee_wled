@@ -14,6 +14,7 @@ Technical background, discoveries, and design decisions for the Zigbee WLED Brid
 - [ESP-Zigbee SDK Internals](#esp-zigbee-sdk-internals)
 - [WLED JSON API](#wled-json-api)
 - [WLED Device Discovery](#wled-device-discovery)
+- [Server-Sent Events (SSE)](#server-sent-events-sse)
 - [Build Environment and Library Issues](#build-environment-and-library-issues)
 - [Runtime Bugs Found and Fixed](#runtime-bugs-found-and-fixed)
 - [Reference Implementation](#reference-implementation)
@@ -33,7 +34,8 @@ The firmware runs on an ESP32-C6 which has both a 2.4GHz WiFi radio and a native
   Hue Bridge ──(802.15.4)──┤  Zigbee ZBOSS stack   │
                            │  (End Device mode)    │
                            │                       │
-  Browser ────(WiFi/HTTP)──┤  WebServer + REST API │
+   Browser ────(WiFi/HTTP)──┤  esp_http_server +     │
+                           │  REST API + SSE        │
                            │                       │
   WLED Devices ──(HTTP)────┤  HTTPClient POST to   │
                            │  /json/state endpoint │
@@ -42,7 +44,7 @@ The firmware runs on an ESP32-C6 which has both a 2.4GHz WiFi radio and a native
 
 **Threading model:**
 - The Zigbee stack runs in its own FreeRTOS task (`zigbeeTask`, 16KB stack, priority 5). It calls `esp_zb_stack_main_loop()` which never returns.
-- The Arduino `loop()` runs on the default task and handles the web server and WLED output at ~2Hz.
+- The ESP-IDF HTTP server (`esp_http_server`) runs in its own FreeRTOS task — request handlers are called from that task's context. The Arduino `loop()` runs on the default task and handles WLED output at ~2Hz, WiFi reconnection, and SSE event pushing.
 - Light state is shared between the Zigbee task and the main loop via `lightStates[]` protected by `zbStateMutex`.
 - The WLED output loop reads the current light states, applies transition interpolation if active, and sends HTTP POST requests to each WLED device only when state has changed.
 
@@ -693,6 +695,57 @@ Each device is shown as a selectable card in the UI. Clicking a device populates
 
 ---
 
+## Server-Sent Events (SSE)
+
+### Motivation
+
+The original web UI used polling (`setInterval` every 2 seconds) to fetch device status and light state via REST endpoints. On the ESP32-C6 with WiFi/Zigbee coexistence, each HTTP request consumes radio time that competes with Zigbee. SSE replaces polling with a single long-lived connection where the server pushes updates only when state actually changes, significantly reducing WiFi traffic.
+
+### Architecture
+
+The SSE implementation uses ESP-IDF's `esp_http_server` async handler mechanism:
+
+1. **Client connects** to `GET /events` — the `handleEvents()` handler sends HTTP response headers (`Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`) and initial `status` + `lightstate` events.
+
+2. **Async handoff** — `httpd_req_async_handler_begin()` creates an async copy of the request. The handler stores the socket fd and async handle, then returns immediately (freeing the httpd worker thread).
+
+3. **Event pushing** — `ssePollAndPush()` is called from `webLoop()` on each iteration (~2Hz). It compares current state against snapshots and sends SSE events via `httpd_socket_send()` only when state changes. A keepalive comment (`:\n\n`) is sent every ~15 seconds if no events were pushed.
+
+4. **Cleanup** — when the client disconnects, the global `close_fn` callback in `httpd_config_t` fires with the socket fd. The callback cleans up the stored SSE session and calls `close(sockfd)` (required because setting `close_fn` disables the server's automatic socket close).
+
+### Event Types
+
+| Event | Trigger | Payload |
+|-------|---------|---------|
+| `status` | WiFi, Zigbee, or light config changes | JSON: `{"wifi":{"connected":true,"ip":"...","rssi":-55},"zigbee":{"joined":true,"short_addr":"0xABCD","channel":15},"lightCount":1,"lights":[{"name":"...","host":"...","port":80,"type":"rgb"}]}` |
+| `lightstate` | Any light's on/off, brightness, or color changes | JSON array: `[{"on":true,"bri":254,"r":255,"g":0,"b":0,"w":0}]` |
+
+### Client-Side Implementation
+
+The web UI JavaScript uses `EventSource` with automatic reconnection:
+
+```javascript
+const evtSource = new EventSource('/events');
+evtSource.addEventListener('status', (e) => applyStatus(JSON.parse(e.data)));
+evtSource.addEventListener('lightstate', (e) => applyLightStates(JSON.parse(e.data)));
+```
+
+The `applyStatus()` and `applyLightStates()` functions are shared between SSE event handlers and a polling fallback. The fallback activates only if `EventSource` is unsupported or the connection fails — older browsers will still work.
+
+### Key Implementation Details
+
+- **Single client limit** — only one SSE client is supported at a time. A new connection replaces the previous one (the old async handle is completed with `httpd_req_async_handler_complete()`).
+- **Change detection** — `StatusSnapshot` and `LightSnapshot` structs capture the current state each cycle. Events are sent only when snapshots differ from the previous push.
+- **Thread safety** — `httpd_socket_send()` is called from the Arduino `loop()` task. The httpd server runs in a separate task, but `httpd_socket_send()` is documented as thread-safe.
+- **Error handling** — if `httpd_socket_send()` fails (returns ≤ 0), the SSE session is cleaned up. The client's `EventSource` auto-reconnects after a browser-default delay (~3 seconds).
+- **Keepalive** — a comment line (`:\n\n`) is sent every ~15 seconds to detect stale connections. Without keepalive, a silently dropped connection would not be detected until the next state change.
+
+### Blocking Handler Pitfall
+
+The initial SSE implementation used a `while(true)` loop with `vTaskDelay()` inside the handler, which blocked the httpd worker thread indefinitely. Since `esp_http_server` has a limited thread pool (default 1 worker), all other HTTP requests (REST API, OTA, web UI) were blocked. The fix was switching to the async handler pattern described above.
+
+---
+
 ## Build Environment and Library Issues
 
 ### Platform
@@ -708,9 +761,19 @@ This provides:
 - ESP-Zigbee SDK (included in the libs package)
 - RISC-V GCC 14.2.0
 
-### ESPAsyncWebServer Incompatibility
+### ESPAsyncWebServer Incompatibility → esp_http_server Migration
 
-ESPAsyncWebServer + AsyncTCP is incompatible with the ESP32-C6 USB serial configuration. The C6 uses a hardware UART over USB (not USB CDC like the S3), and `ARDUINO_USB_CDC_ON_BOOT=1` causes compilation failures in AsyncTCP. We use the built-in synchronous `WebServer` library instead.
+ESPAsyncWebServer + AsyncTCP is incompatible with the ESP32-C6 USB serial configuration. The C6 uses a hardware UART over USB (not USB CDC like the S3), and `ARDUINO_USB_CDC_ON_BOOT=1` causes compilation failures in AsyncTCP. Initially we used the built-in synchronous Arduino `WebServer` library instead.
+
+Later, we migrated from Arduino `WebServer` to ESP-IDF's native `esp_http_server` to enable Server-Sent Events (SSE). The synchronous Arduino `WebServer` required explicit `handleClient()` calls in `loop()` and had no mechanism for long-lived streaming connections. `esp_http_server` runs in its own FreeRTOS task, supports async request handling via `httpd_req_async_handler_begin()`, and allows pushing data to connected clients from any context using `httpd_socket_send()`. See the [Server-Sent Events](#server-sent-events-sse) section for details.
+
+Key differences from Arduino `WebServer`:
+- Request body read via `httpd_req_recv()` (may require multiple calls for large payloads)
+- POST data is not pre-parsed — manual content reading required
+- OTA uploads use manual multipart boundary parsing instead of an upload callback
+- URI matching supports wildcards via `httpd_uri_match_wildcard`
+- No `handleClient()` in `loop()` — the server runs autonomously
+- `httpd_config_t.max_uri_handlers` must be set high enough for all routes (currently 14)
 
 ### ArduinoJson v7
 
@@ -730,8 +793,8 @@ The `ESPmDNS` library is also built into the Arduino ESP32 framework. Key discov
 ### Build Size
 
 The WLED variant builds successfully on the 4MB partition layout:
-- **RAM usage:** 20.1%
-- **Flash usage:** 90.9%
+- **RAM usage:** ~20%
+- **Flash usage:** ~92%
 
 Flash is near capacity. Adding significant new features may require switching to the 8MB flash variant or optimizing the web UI HTML (which is compiled into the binary as string literals).
 
