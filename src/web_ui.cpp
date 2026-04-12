@@ -204,7 +204,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <label style="margin:0">Or discover WLED devices on network:</label>
         <button class="btn btn-sm" style="background:#0f3460" onclick="discoverWled()" id="discoverBtn">Scan</button>
       </div>
-      <div id="discoveryResults">
+      <div id="discoveryResults" style="max-height:200px;overflow-y:auto">
         <div class="discover-status" id="discoveryStatus">Click "Scan" to find WLED devices</div>
       </div>
     </div>
@@ -347,12 +347,14 @@ async function discoverWled() {
     if (devices.length === 0) {
       results.innerHTML = '<div class="discover-status">No WLED devices found. Make sure they are on the same network.</div>';
     } else {
-      results.innerHTML = devices.map((d, i) =>
-        `<div class="wled-device" onclick="selectWledDevice(this, '${escAttr(d.host)}', ${d.port}, '${escAttr(d.name)}', ${d.isRGBW ? 'true' : 'false'})">
+      results.innerHTML = devices.map((d, i) => {
+        const preferredHost = d.hostname || d.host;
+        const hostDisplay = d.hostname ? d.hostname + ' (' + d.host + ')' : d.host;
+        return `<div class="wled-device" onclick="selectWledDevice(this, '${escAttr(preferredHost)}', ${d.port}, '${escAttr(d.name)}', ${d.isRGBW ? 'true' : 'false'})">
           <div class="dev-name">${escHtml(d.name)}</div>
-          <div class="dev-detail">${escHtml(d.host)}:${d.port} | ${d.ledCount} LEDs | ${d.isRGBW ? 'RGBW' : 'RGB'} | v${escHtml(d.version)}</div>
-        </div>`
-      ).join('');
+          <div class="dev-detail">${escHtml(hostDisplay)}:${d.port} | ${d.ledCount} LEDs | ${d.isRGBW ? 'RGBW' : 'RGB'} | v${escHtml(d.version)}</div>
+        </div>`;
+      }).join('');
     }
   } catch(e) {
     results.innerHTML = '<div class="discover-status" style="color:#e74c3c">Discovery failed: ' + escHtml(e.message) + '</div>';
@@ -603,6 +605,7 @@ static void setupRoutes() {
       JsonObject obj = arr.add<JsonObject>();
       obj["name"] = dev.name;
       obj["host"] = dev.host;
+      obj["hostname"] = dev.hostname;
       obj["port"] = dev.port;
       obj["mac"] = dev.mac;
       obj["ledCount"] = dev.ledCount;
