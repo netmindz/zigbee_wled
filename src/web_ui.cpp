@@ -696,6 +696,8 @@ static esp_err_t handleLightState(httpd_req_t *req) {
     obj["g"] = static_cast<uint8_t>(st.green * briScale);
     obj["b"] = static_cast<uint8_t>(st.blue * briScale);
     obj["w"] = static_cast<uint8_t>(st.white * briScale);
+    obj["x"] = serialized(String(st.colorX, 4));
+    obj["y"] = serialized(String(st.colorY, 4));
   }
   String json;
   serializeJson(doc, json);
@@ -1055,6 +1057,8 @@ static String buildLightStateJson() {
     obj["g"] = static_cast<uint8_t>(st.green * briScale);
     obj["b"] = static_cast<uint8_t>(st.blue * briScale);
     obj["w"] = static_cast<uint8_t>(st.white * briScale);
+    obj["x"] = serialized(String(st.colorX, 4));
+    obj["y"] = serialized(String(st.colorY, 4));
   }
   String json;
   serializeJson(doc, json);

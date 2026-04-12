@@ -211,13 +211,74 @@ def get_device_light_state(device_ip: str) -> Optional[list]:
 #  Color conversion helpers (must match firmware's zigbee_manager.cpp)
 # ---------------------------------------------------------------------------
 
+def _cross2d(ox: float, oy: float, ax: float, ay: float,
+             bx: float, by: float) -> float:
+    """2D cross product: (a - o) x (b - o)."""
+    return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+
+
+# sRGB gamut triangle vertices in CIE 1931 xy
+_SRGB_R = (0.6400, 0.3300)
+_SRGB_G = (0.3000, 0.6000)
+_SRGB_B = (0.1500, 0.0600)
+_D65    = (0.3127, 0.3290)
+
+
+def _in_srgb_gamut(x: float, y: float) -> bool:
+    """Test if CIE xy point is inside the sRGB gamut triangle."""
+    d1 = _cross2d(x, y, *_SRGB_R, *_SRGB_G)
+    d2 = _cross2d(x, y, *_SRGB_G, *_SRGB_B)
+    d3 = _cross2d(x, y, *_SRGB_B, *_SRGB_R)
+    has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+    has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+    return not (has_neg and has_pos)
+
+
+def _ray_seg_intersect(x1: float, y1: float, x2: float, y2: float,
+                       x3: float, y3: float, x4: float, y4: float) -> float:
+    """Intersect ray (p1 -> p2) with segment (p3, p4). Returns t or -1."""
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-10:
+        return -1.0
+    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+    u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+    return t if (0.0 <= u <= 1.0 and t >= 0.0) else -1.0
+
+
+def _map_to_srgb_gamut(x: float, y: float) -> tuple:
+    """
+    Map out-of-gamut CIE xy into sRGB by projecting from D65 white through
+    the target point onto the gamut boundary. Preserves hue, clips saturation.
+    Matches the firmware's mapToSRGBGamut().
+    """
+    if _in_srgb_gamut(x, y):
+        return (x, y)
+    edges = [
+        (*_SRGB_R, *_SRGB_G),
+        (*_SRGB_G, *_SRGB_B),
+        (*_SRGB_B, *_SRGB_R),
+    ]
+    best_t = -1.0
+    best_x, best_y = x, y
+    for ex1, ey1, ex2, ey2 in edges:
+        t = _ray_seg_intersect(_D65[0], _D65[1], x, y, ex1, ey1, ex2, ey2)
+        if 0.0 < t <= 1.0 and t > best_t:
+            best_t = t
+            best_x = _D65[0] + t * (x - _D65[0])
+            best_y = _D65[1] + t * (y - _D65[1])
+    return (best_x, best_y)
+
+
 def cie_xy_to_rgb(x: float, y: float) -> tuple:
     """
     Convert CIE 1931 xy chromaticity to RGB (0-255).
-    Matches the firmware's xyToRGB() function.
+    Matches the firmware's xyToRGB() function, including sRGB gamut mapping.
     """
     if y < 0.001:
         y = 0.001
+
+    # Map out-of-gamut points into sRGB triangle
+    x, y = _map_to_srgb_gamut(x, y)
     Y = 1.0
     X = (Y / y) * x
     Z = (Y / y) * (1.0 - x - y)
@@ -227,10 +288,17 @@ def cie_xy_to_rgb(x: float, y: float) -> tuple:
     gf = X * -0.9692660 + Y * 1.8760108 + Z * 0.0415560
     bf = X * 0.0556434 + Y * -0.2040259 + Z * 1.0572252
 
-    # Clamp
-    rf = max(0.0, min(1.0, rf))
-    gf = max(0.0, min(1.0, gf))
-    bf = max(0.0, min(1.0, bf))
+    # Clamp negatives to 0 (out-of-gamut handling)
+    rf = max(0.0, rf)
+    gf = max(0.0, gf)
+    bf = max(0.0, bf)
+
+    # Normalize so max channel = 1.0 BEFORE gamma — preserves channel ratios
+    max_c = max(rf, gf, bf)
+    if max_c > 0.001:
+        rf /= max_c
+        gf /= max_c
+        bf /= max_c
 
     # Reverse gamma (sRGB)
     def reverse_gamma(v):
@@ -240,15 +308,10 @@ def cie_xy_to_rgb(x: float, y: float) -> tuple:
     gf = reverse_gamma(gf)
     bf = reverse_gamma(bf)
 
-    # Scale so max component = 255
-    max_c = max(rf, gf, bf)
-    if max_c > 0.001:
-        scale = 255.0 / max_c
-        r = int(rf * scale + 0.5)
-        g = int(gf * scale + 0.5)
-        b = int(bf * scale + 0.5)
-    else:
-        r = g = b = 0
+    # Scale to 255
+    r = int(rf * 255.0 + 0.5)
+    g = int(gf * 255.0 + 0.5)
+    b = int(bf * 255.0 + 0.5)
 
     return (r, g, b)
 
@@ -595,10 +658,14 @@ def test_light_color_accuracy(api: HueAPI, light_id: str, device_ip: str,
 
     for name, xy in test_cases:
         print(f"  Testing {name} (requested xy={xy})...")
+        # Ensure light is on before each color test (previous test may have
+        # caused the Bridge to turn it off, e.g. for extreme gamut points)
+        api.set_light_state(light_id, {"on": True})
+        time.sleep(0.3)
         api.set_light_state(light_id, {"xy": xy})
         time.sleep(settle_time)
 
-        # Read the device's own computed RGB (what it received via ZCL)
+        # Read the device's own computed RGB and the actual ZCL xy it received
         dev_state = get_device_light_state(device_ip)
         if not dev_state or light_index >= len(dev_state):
             results.check(f"Light {light_id} {name}: device state readable",
@@ -612,23 +679,33 @@ def test_light_color_accuracy(api: HueAPI, light_id: str, device_ip: str,
         print(f"    Device reports RGB: R={dev_r} G={dev_g} B={dev_b} "
               f"(on={ls.get('on')}, bri={ls.get('bri')})")
 
-        # Compute expected from Bridge-reported xy (may differ from requested
-        # due to gamut mapping, but should be in the same ballpark)
-        state = api.get_light(light_id).get("state", {})
-        reported_xy = state.get("xy", xy)
-        exp_r, exp_g, exp_b = cie_xy_to_rgb(reported_xy[0], reported_xy[1])
-        print(f"    Expected RGB (from Bridge xy={reported_xy}): "
+        # Use the device-reported CIE xy (the actual ZCL values the firmware
+        # received from the Bridge, which may differ from what the Bridge API
+        # reports due to gamut mapping). Fall back to Bridge-reported xy if
+        # the device doesn't expose xy (older firmware).
+        dev_x = ls.get("x")
+        dev_y = ls.get("y")
+        if dev_x is not None and dev_y is not None:
+            source_xy = [float(dev_x), float(dev_y)]
+            xy_source = "device"
+        else:
+            state = api.get_light(light_id).get("state", {})
+            source_xy = state.get("xy", xy)
+            xy_source = "bridge"
+        exp_r, exp_g, exp_b = cie_xy_to_rgb(source_xy[0], source_xy[1])
+        print(f"    Expected RGB (from {xy_source} xy={source_xy}): "
               f"R={exp_r} G={exp_g} B={exp_b}")
 
-        # Device RGB should be reasonably close to what xyToRGB produces
-        # from the Bridge-reported xy (tolerance is wider because the Bridge
-        # gamut-maps before sending ZCL, and ZCL precision is limited)
+        # When using device-reported xy, the expected and actual RGB should
+        # match exactly (both computed from the same ZCL values). Use a small
+        # tolerance for brightness scaling rounding.
+        tol = 2 if xy_source == "device" else 15
         results.check(f"Light {light_id} {name}: R accuracy",
-                      exp_r, dev_r, tolerance=15)
+                      exp_r, dev_r, tolerance=tol)
         results.check(f"Light {light_id} {name}: G accuracy",
-                      exp_g, dev_g, tolerance=15)
+                      exp_g, dev_g, tolerance=tol)
         results.check(f"Light {light_id} {name}: B accuracy",
-                      exp_b, dev_b, tolerance=15)
+                      exp_b, dev_b, tolerance=tol)
 
 
 def test_light_color_temperature(api: HueAPI, light_id: str, device_ip: str,

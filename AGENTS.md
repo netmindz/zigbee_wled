@@ -55,6 +55,12 @@ python3 tools/hue_debug.py --device-ip <IP>
 python3 tools/hue_debug.py --search   # Trigger Zigbee light search
 ```
 
+## Workflow Rules
+
+- **Always flash and test on hardware before committing.** Never commit
+  untested firmware. Build, flash, verify behavior on the physical device,
+  then commit once it works.
+
 ## CI
 
 GitHub Actions (`.github/workflows/build.yml`) runs `pio run -e esp32c6` on

@@ -36,6 +36,8 @@ struct LightState {
   uint8_t  green;
   uint8_t  blue;
   uint8_t  white;        // only used for RGBW
+  float    colorX;       // CIE 1931 x (0.0-1.0), last received from ZCL
+  float    colorY;       // CIE 1931 y (0.0-1.0), last received from ZCL
 
   // Transition support: when a transition is active, we interpolate from
   // start values to current (target) values over the transition period.
