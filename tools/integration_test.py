@@ -1,32 +1,28 @@
 #!/usr/bin/env python3
 """
-Integration test for Zigbee DMX Bridge.
+Integration test for Zigbee WLED Bridge.
 
 Verifies end-to-end that light states set via the Philips Hue REST API
-are correctly reflected in the ArtNet DMX output from the ESP32-C6 device.
+are correctly reflected in the device's internal state (queried via the
+ESP32 web API at /api/lights/state), which is what gets sent to WLED
+devices over HTTP.
 
 Test flow:
   1. Connect to the Hue Bridge (reuses .hue_api_key from hue_debug.py)
   2. Identify which Hue light ID(s) correspond to our ESP32 device
-  3. Query the ESP32 web API for DMX channel mapping
-  4. Set a known color/brightness on the Hue light
-  5. Listen for ArtNet packets from the ESP32 on UDP port 6454
-  6. Parse the ArtNet DMX512 data and verify the expected channel values
+  3. Set a known color/brightness on the Hue light
+  4. Query the ESP32's /api/lights/state to read the computed RGB/RGBW values
+  5. Verify the device state matches the expected color conversion
 
 Tests include:
-  - ON/OFF: verify power state is reflected in DMX output
-  - COLOR: verify CIE xy color changes produce correct DMX RGB values
-  - BRIGHTNESS: verify brightness scaling in DMX output
-  - ACCURACY: verify device-reported state matches ArtNet output
+  - ON/OFF: verify power state is reflected in device state
+  - COLOR: verify CIE xy color changes produce correct RGB values
+  - BRIGHTNESS: verify brightness scaling
+  - ACCURACY: verify device-reported state matches expected color pipeline
   - COLORTEMP: verify mirek (color temperature) control
   - RGBW: verify white channel decomposition for RGBW-configured lights
     (W = min(R,G,B), then R'=R-W, G'=G-W, B'=B-W)
-
-ArtNet protocol overview:
-  - UDP port 6454
-  - OpDmx (0x5000): 18-byte header + up to 512 DMX channel bytes
-  - Header: "Art-Net\\0" (8 bytes) + opcode LE (2) + proto ver BE (2)
-            + sequence (1) + physical (1) + universe LE (2) + length BE (2)
+  - SSE: verify Server-Sent Events stream (no Hue Bridge required)
 
 Prerequisites:
   pip install requests
@@ -38,26 +34,19 @@ Usage:
   # Specify bridge IP and light ID explicitly:
   python3 tools/integration_test.py --bridge-ip 192.168.178.216 --light-id 25
 
-  # Specify ArtNet listen interface (default: 0.0.0.0):
-  python3 tools/integration_test.py --device-ip 192.168.178.110 --listen-ip 0.0.0.0
-
-  # Skip ArtNet verification (only test Hue API round-trip):
-  python3 tools/integration_test.py --device-ip 192.168.178.110 --skip-artnet
-
   # Increase wait time for slow Zigbee propagation:
   python3 tools/integration_test.py --device-ip 192.168.178.110 --settle-time 3.0
+
+  # Run only SSE tests (no Hue Bridge required):
+  python3 tools/integration_test.py --device-ip 192.168.178.110 --test sse
 
   # Run only RGBW tests:
   python3 tools/integration_test.py --device-ip 192.168.178.110 --test rgbw
 """
 
 import argparse
-import colorsys
 import json
 import math
-import os
-import socket
-import struct
 import sys
 import threading
 import time
@@ -78,161 +67,17 @@ except ImportError:
 #  Constants
 # ---------------------------------------------------------------------------
 
-ARTNET_PORT = 6454
-ARTNET_HEADER = b"Art-Net\x00"
-ARTNET_OP_DMX = 0x5000
-ARTNET_PROTOCOL_VERSION = 14
-
 # Hue API key file (shared with hue_debug.py)
 API_KEY_FILE = ".hue_api_key"
 
 # Our device's manufacturer name as registered in Zigbee basic cluster
-DEVICE_MANUFACTURER = "ZigbeeDMX"
+DEVICE_MANUFACTURER = "ZigbeeWLED"
 
-# Tolerance for DMX value comparison (to account for float rounding)
-DMX_TOLERANCE = 2
+# Tolerance for RGB value comparison (to account for float rounding)
+RGB_TOLERANCE = 2
 
 # Default settle time after sending a Hue command (seconds)
 DEFAULT_SETTLE_TIME = 2.0
-
-
-# ---------------------------------------------------------------------------
-#  ArtNet Listener
-# ---------------------------------------------------------------------------
-
-class ArtNetListener:
-    """Listens for ArtNet DMX packets on a UDP socket."""
-
-    def __init__(self, listen_ip: str = "0.0.0.0", universe: int = 0):
-        self.listen_ip = listen_ip
-        self.universe = universe
-        self.sock = None
-        self.running = False
-        self.thread = None
-        self.last_packet = None       # raw bytes of last matching OpDmx
-        self.last_dmx_data = None     # bytearray of DMX channel values (1-indexed concept, 0-indexed array)
-        self.last_source_ip = None
-        self.packet_count = 0
-        self._lock = threading.Lock()
-
-    def start(self):
-        """Start listening in a background thread."""
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Allow receiving broadcast packets
-        try:
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        except Exception:
-            pass
-        self.sock.bind((self.listen_ip, ARTNET_PORT))
-        self.sock.settimeout(1.0)
-        self.running = True
-        self.thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self.thread.start()
-        print(f"  ArtNet listener started on {self.listen_ip}:{ARTNET_PORT} "
-              f"(universe {self.universe})")
-
-    def stop(self):
-        """Stop the listener."""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=3)
-        if self.sock:
-            self.sock.close()
-            self.sock = None
-
-    def _listen_loop(self):
-        while self.running:
-            try:
-                data, addr = self.sock.recvfrom(1024)
-                self._handle_packet(data, addr)
-            except socket.timeout:
-                continue
-            except OSError:
-                if self.running:
-                    raise
-                break
-
-    def _handle_packet(self, data: bytes, addr: tuple):
-        """Parse an ArtNet packet."""
-        if len(data) < 18:
-            return
-        # Check Art-Net header
-        if data[:8] != ARTNET_HEADER:
-            return
-        # Opcode (little-endian)
-        opcode = struct.unpack_from("<H", data, 8)[0]
-        if opcode != ARTNET_OP_DMX:
-            return
-        # Protocol version (big-endian)
-        proto_ver = struct.unpack_from(">H", data, 10)[0]
-        if proto_ver < ARTNET_PROTOCOL_VERSION:
-            return
-        # Sequence, physical, universe (LE), length (BE)
-        sequence = data[12]
-        physical = data[13]
-        universe = struct.unpack_from("<H", data, 14)[0]
-        dmx_length = struct.unpack_from(">H", data, 16)[0]
-
-        if universe != self.universe:
-            return
-
-        # Extract DMX data
-        dmx_data = bytearray(data[18:18 + dmx_length])
-
-        with self._lock:
-            self.last_packet = data
-            self.last_dmx_data = dmx_data
-            self.last_source_ip = addr[0]
-            self.packet_count += 1
-
-    def get_dmx_data(self) -> Optional[bytearray]:
-        """Return the latest DMX data snapshot, or None if no packet received."""
-        with self._lock:
-            if self.last_dmx_data is not None:
-                return bytearray(self.last_dmx_data)
-        return None
-
-    def get_channel(self, channel: int) -> Optional[int]:
-        """Get a single DMX channel value (1-indexed). Returns None if no data."""
-        with self._lock:
-            if self.last_dmx_data is None:
-                return None
-            idx = channel - 1  # DMX channels are 1-indexed, array is 0-indexed
-            if idx < 0 or idx >= len(self.last_dmx_data):
-                return None
-            return self.last_dmx_data[idx]
-
-    def wait_for_packet(self, timeout: float = 5.0) -> bool:
-        """Wait until at least one packet is received. Returns True if received."""
-        start = time.time()
-        initial_count = self.packet_count
-        while time.time() - start < timeout:
-            if self.packet_count > initial_count:
-                return True
-            time.sleep(0.05)
-        return False
-
-    def wait_for_fresh_data(self, timeout: float = 5.0) -> Optional[bytearray]:
-        """Clear old data, wait for a new packet, and return the DMX data."""
-        with self._lock:
-            self.last_dmx_data = None
-            self.last_packet = None
-            initial_count = self.packet_count
-        start = time.time()
-        while time.time() - start < timeout:
-            with self._lock:
-                if self.packet_count > initial_count and self.last_dmx_data is not None:
-                    return bytearray(self.last_dmx_data)
-            time.sleep(0.05)
-        return None
-
-    def clear(self):
-        """Clear the last received data (useful before a new test)."""
-        with self._lock:
-            self.last_dmx_data = None
-            self.last_packet = None
-            self.packet_count = 0
 
 
 # ---------------------------------------------------------------------------
@@ -345,15 +190,6 @@ def get_device_config(device_ip: str) -> Optional[dict]:
     return None
 
 
-def set_device_config(device_ip: str, config: dict) -> bool:
-    """Push a config to the ESP32 device via POST /api/config."""
-    r = _device_request("POST", f"http://{device_ip}/api/config", json=config)
-    if r is not None:
-        result = r.json()
-        return result.get("ok", False)
-    return False
-
-
 def get_device_status(device_ip: str) -> Optional[dict]:
     """Query the ESP32 device status API."""
     r = _device_request("GET", f"http://{device_ip}/api/status")
@@ -363,140 +199,12 @@ def get_device_status(device_ip: str) -> Optional[dict]:
 
 
 def get_device_light_state(device_ip: str) -> Optional[list]:
-    """Query the ESP32 device /api/lights/state for current per-light RGB."""
+    """Query the ESP32 device /api/lights/state for current per-light RGBW."""
     r = _device_request("GET", f"http://{device_ip}/api/lights/state")
     if r is not None:
         data = r.json()
         return data.get("lights", [])
     return None
-
-
-# The config we push to the device to ensure a known-good test state.
-# Light 1: RGB at DMX address 1, Light 2: RGBW at DMX address 4.
-# ArtNet output on universe 0.
-TEST_CONFIG = {
-    "output": {
-        "mode": "artnet",
-        "txPin": 2,
-        "enPin": 4,
-        "artnetUniverse": 0
-    },
-    "lights": [
-        {
-            "name": "Test Light 1",
-            "type": "RGB",
-            "dmxAddr": 1,
-            "channelMap": {"r": 0, "g": 1, "b": 2}
-        },
-        {
-            "name": "Test Light 2",
-            "type": "RGBW",
-            "dmxAddr": 4,
-            "channelMap": {"r": 0, "g": 1, "b": 2, "w": 3}
-        }
-    ]
-}
-
-
-def get_local_ip_for_device(device_ip: str) -> Optional[str]:
-    """Determine which local IP would be used to reach the device."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect((device_ip, 1))  # doesn't actually send anything
-        local_ip = s.getsockname()[0]
-        s.close()
-        return local_ip
-    except Exception:
-        return None
-
-
-def configure_device_for_test(device_ip: str, universe: int = 0,
-                              listen_ip: str = "0.0.0.0") -> Optional[dict]:
-    """
-    Ensure the device is configured for ArtNet output with a known test light.
-    Sets artnetTargetIp to our local IP so the device sends unicast to us
-    (broadcast UDP is unreliable under WiFi/802.15.4 coexistence).
-    Returns the active config after setup, or None on failure.
-    """
-    print(f"\nConfiguring device at {device_ip} for integration test...")
-
-    # Determine our local IP to receive ArtNet packets
-    if listen_ip and listen_ip != "0.0.0.0":
-        our_ip = listen_ip
-    else:
-        our_ip = get_local_ip_for_device(device_ip)
-    if not our_ip:
-        print("  WARNING: Could not determine local IP for ArtNet target")
-        our_ip = ""
-
-    # Read current config
-    current = get_device_config(device_ip)
-    if current is None:
-        print("  ERROR: Cannot read device config.", file=sys.stderr)
-        return None
-
-    current_output = current.get("output", {})
-    current_mode = current_output.get("mode", "dmx")
-    current_universe = current_output.get("artnetUniverse", 0)
-    current_target = current_output.get("artnetTargetIp", "")
-    current_lights = current.get("lights", [])
-
-    # Check if config already matches
-    needs_update = False
-    if current_mode != "artnet":
-        print(f"  Output mode is '{current_mode}', switching to 'artnet'")
-        needs_update = True
-    if current_universe != universe:
-        print(f"  ArtNet universe is {current_universe}, switching to {universe}")
-        needs_update = True
-    if our_ip and current_target != our_ip:
-        print(f"  ArtNet target is '{current_target}', switching to '{our_ip}'")
-        needs_update = True
-    if len(current_lights) == 0:
-        print(f"  No lights configured, adding test light")
-        needs_update = True
-
-    if needs_update:
-        # Build config: keep existing lights if any, otherwise use test default
-        config = dict(TEST_CONFIG)
-        config["output"] = dict(TEST_CONFIG["output"])
-        config["output"]["artnetUniverse"] = universe
-        config["output"]["artnetTargetIp"] = our_ip
-        if len(current_lights) > 0:
-            # Keep existing lights, just fix the output mode
-            config["lights"] = current_lights
-
-        print(f"  Pushing config: {len(config['lights'])} light(s), "
-              f"artnet universe={universe}, target={our_ip}")
-        if not set_device_config(device_ip, config):
-            print("  ERROR: Failed to push config to device.", file=sys.stderr)
-            return None
-
-        # Give device time to reconfigure DMX output
-        print("  Waiting 3s for device to reconfigure...")
-        time.sleep(3)
-
-        # Re-read to confirm
-        config = get_device_config(device_ip)
-        if config is None:
-            print("  ERROR: Cannot re-read device config after update.",
-                  file=sys.stderr)
-            return None
-        mode = config.get("output", {}).get("mode", "dmx")
-        if mode != "artnet":
-            print(f"  ERROR: Device still in '{mode}' mode after config push.",
-                  file=sys.stderr)
-            return None
-        print(f"  Device configured: mode=artnet, "
-              f"universe={config['output'].get('artnetUniverse', 0)}, "
-              f"target={config['output'].get('artnetTargetIp', '')}, "
-              f"{len(config.get('lights', []))} light(s)")
-    else:
-        print(f"  Device already configured for ArtNet (universe={universe}, "
-              f"{len(current_lights)} light(s))")
-        config = current
-
-    return config
 
 
 # ---------------------------------------------------------------------------
@@ -578,447 +286,6 @@ def zcl_xy_to_hue(zcl_x: int, zcl_y: int) -> tuple:
     return (zcl_x / 65279.0, zcl_y / 65279.0)
 
 
-# ---------------------------------------------------------------------------
-#  Test helpers
-# ---------------------------------------------------------------------------
-
-def read_dmx_rgb(listener: ArtNetListener, dmx_start: int,
-                 channel_map: dict, settle_time: float) -> Optional[tuple]:
-    """
-    Wait for a fresh ArtNet packet and extract the RGB DMX values.
-    Returns (dmx_r, dmx_g, dmx_b) or None if no packet received.
-    """
-    dmx = listener.wait_for_fresh_data(timeout=settle_time + 2.0)
-    if dmx is None:
-        return None
-    r_ch = dmx_start + channel_map.get("r", 0) - 1  # 0-indexed
-    g_ch = dmx_start + channel_map.get("g", 1) - 1
-    b_ch = dmx_start + channel_map.get("b", 2) - 1
-    dmx_r = dmx[r_ch] if r_ch < len(dmx) else 0
-    dmx_g = dmx[g_ch] if g_ch < len(dmx) else 0
-    dmx_b = dmx[b_ch] if b_ch < len(dmx) else 0
-    return (dmx_r, dmx_g, dmx_b)
-
-
-def read_dmx_rgbw(listener: ArtNetListener, dmx_start: int,
-                  channel_map: dict, settle_time: float) -> Optional[tuple]:
-    """
-    Wait for a fresh ArtNet packet and extract RGBW DMX values.
-    Returns (dmx_r, dmx_g, dmx_b, dmx_w) or None if no packet received.
-    """
-    dmx = listener.wait_for_fresh_data(timeout=settle_time + 2.0)
-    if dmx is None:
-        return None
-    r_ch = dmx_start + channel_map.get("r", 0) - 1  # 0-indexed
-    g_ch = dmx_start + channel_map.get("g", 1) - 1
-    b_ch = dmx_start + channel_map.get("b", 2) - 1
-    w_ch = dmx_start + channel_map.get("w", 3) - 1
-    dmx_r = dmx[r_ch] if r_ch < len(dmx) else 0
-    dmx_g = dmx[g_ch] if g_ch < len(dmx) else 0
-    dmx_b = dmx[b_ch] if b_ch < len(dmx) else 0
-    dmx_w = dmx[w_ch] if w_ch < len(dmx) else 0
-    return (dmx_r, dmx_g, dmx_b, dmx_w)
-
-
-def find_device_lights(api: HueAPI, device_eui64: Optional[str] = None,
-                       manufacturer: str = DEVICE_MANUFACTURER) -> dict:
-    """
-    Find Hue light IDs belonging to our device.
-    Returns {hue_light_id: light_data} for matching lights.
-    """
-    all_lights = api.get_lights()
-    matches = {}
-    for lid, light in all_lights.items():
-        mfr = light.get("manufacturername", "")
-        uid = light.get("uniqueid", "")
-        if mfr == manufacturer:
-            matches[lid] = light
-        elif device_eui64 and device_eui64.lower().replace(":", "") in uid.lower().replace(":", "").replace("-", ""):
-            matches[lid] = light
-    return matches
-
-
-def compute_expected_dmx(r: int, g: int, b: int, brightness: int,
-                         power_on: bool) -> tuple:
-    """
-    Compute the expected DMX channel values after brightness scaling.
-    Matches firmware's dmx_output.cpp update() logic.
-
-    brightness: Zigbee scale 0-254
-    Returns (dmx_r, dmx_g, dmx_b)
-    """
-    if not power_on:
-        return (0, 0, 0)
-    bri_scale = brightness / 254.0
-    dmx_r = int(r * bri_scale)
-    dmx_g = int(g * bri_scale)
-    dmx_b = int(b * bri_scale)
-    return (dmx_r, dmx_g, dmx_b)
-
-
-def decompose_rgbw(r: int, g: int, b: int) -> tuple:
-    """
-    RGB-to-RGBW decomposition: extract the white component.
-    Matches firmware's decomposeRGBW() in zigbee_manager.cpp.
-
-    The white component is min(R, G, B), subtracted from each RGB channel.
-    Returns (r', g', b', w).
-    """
-    w = min(r, g, b)
-    return (r - w, g - w, b - w, w)
-
-
-def compute_expected_dmx_rgbw(r: int, g: int, b: int, brightness: int,
-                               power_on: bool) -> tuple:
-    """
-    Compute expected RGBW DMX values after decomposition and brightness scaling.
-    Matches firmware pipeline: decomposeRGBW() then brightness scaling in dmx_output.
-
-    Note: The firmware applies decomposition BEFORE storing state, and brightness
-    scaling happens in dmx_output. So the input r,g,b here should be the raw
-    (pre-decomposition) values from xyToRGB/mirekToRGB.
-
-    Returns (dmx_r, dmx_g, dmx_b, dmx_w)
-    """
-    if not power_on:
-        return (0, 0, 0, 0)
-    r2, g2, b2, w = decompose_rgbw(r, g, b)
-    bri_scale = brightness / 254.0
-    return (int(r2 * bri_scale), int(g2 * bri_scale),
-            int(b2 * bri_scale), int(w * bri_scale))
-
-
-class TestResult:
-    """Collects pass/fail results."""
-
-    def __init__(self):
-        self.tests = []
-        self.passed = 0
-        self.failed = 0
-
-    def check(self, name: str, expected, actual, tolerance=DMX_TOLERANCE):
-        """Check a single value with tolerance."""
-        if isinstance(expected, tuple) and isinstance(actual, tuple):
-            ok = all(abs(e - a) <= tolerance for e, a in zip(expected, actual))
-        elif isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
-            ok = abs(expected - actual) <= tolerance
-        else:
-            ok = (expected == actual)
-
-        status = "PASS" if ok else "FAIL"
-        self.tests.append((name, status, expected, actual))
-        if ok:
-            self.passed += 1
-        else:
-            self.failed += 1
-        return ok
-
-    def summary(self):
-        print()
-        print("=" * 60)
-        print(f"  TEST RESULTS: {self.passed} passed, {self.failed} failed, "
-              f"{self.passed + self.failed} total")
-        print("=" * 60)
-        for name, status, expected, actual in self.tests:
-            icon = "PASS" if status == "PASS" else "FAIL"
-            print(f"  [{icon}] {name}")
-            if status == "FAIL":
-                print(f"         expected: {expected}")
-                print(f"         actual:   {actual}")
-        print()
-        return self.failed == 0
-
-
-# ---------------------------------------------------------------------------
-#  Test scenarios
-# ---------------------------------------------------------------------------
-
-def test_light_on_off(api: HueAPI, light_id: str, listener: Optional[ArtNetListener],
-                      dmx_start: int, channel_map: dict, results: TestResult,
-                      settle_time: float, light_type: str = "RGB"):
-    """Test turning a light on and off."""
-    print(f"\n--- Test: ON/OFF for light #{light_id} ---")
-    is_rgbw = (light_type == "RGBW")
-
-    # Turn ON, full brightness, white
-    print("  Setting light ON, brightness=254, white...")
-    api.set_light_state(light_id, {"on": True, "bri": 254, "xy": [0.3127, 0.3290]})
-    time.sleep(settle_time)
-
-    state = api.get_light(light_id).get("state", {})
-    results.check(f"Light {light_id} ON: Hue reports on=True",
-                  True, state.get("on"))
-
-    if listener:
-        if is_rgbw:
-            rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-            if rgbw is None:
-                results.check(f"Light {light_id} ON: ArtNet packet received", True, False)
-            else:
-                dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-                print(f"  ArtNet DMX values: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
-                # For RGBW white, most output is on W channel; total should be > 200
-                total = dmx_r + dmx_g + dmx_b + dmx_w
-                results.check(f"Light {light_id} ON: RGBW total output > 200",
-                              True, total > 200)
-                results.check(f"Light {light_id} ON: RGBW W channel > 200",
-                              True, dmx_w > 200)
-        else:
-            rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
-            if rgb is None:
-                results.check(f"Light {light_id} ON: ArtNet packet received", True, False)
-            else:
-                dmx_r, dmx_g, dmx_b = rgb
-                print(f"  ArtNet DMX values: R={dmx_r} G={dmx_g} B={dmx_b}")
-                # White at full brightness should have high values on all channels
-                results.check(f"Light {light_id} ON: DMX R > 200", True, dmx_r > 200)
-                results.check(f"Light {light_id} ON: DMX G > 200", True, dmx_g > 200)
-                results.check(f"Light {light_id} ON: DMX B > 200", True, dmx_b > 200)
-
-    # Turn OFF
-    print("  Setting light OFF...")
-    api.set_light_state(light_id, {"on": False})
-    time.sleep(settle_time)
-
-    state = api.get_light(light_id).get("state", {})
-    results.check(f"Light {light_id} OFF: Hue reports on=False",
-                  False, state.get("on"))
-
-    if listener:
-        if is_rgbw:
-            rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-            if rgbw is None:
-                results.check(f"Light {light_id} OFF: ArtNet packet received", True, False)
-            else:
-                dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-                print(f"  ArtNet DMX values: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
-                results.check(f"Light {light_id} OFF: DMX R == 0", 0, dmx_r)
-                results.check(f"Light {light_id} OFF: DMX G == 0", 0, dmx_g)
-                results.check(f"Light {light_id} OFF: DMX B == 0", 0, dmx_b)
-                results.check(f"Light {light_id} OFF: DMX W == 0", 0, dmx_w)
-        else:
-            rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
-            if rgb is None:
-                results.check(f"Light {light_id} OFF: ArtNet packet received", True, False)
-            else:
-                dmx_r, dmx_g, dmx_b = rgb
-                print(f"  ArtNet DMX values: R={dmx_r} G={dmx_g} B={dmx_b}")
-                results.check(f"Light {light_id} OFF: DMX R == 0", 0, dmx_r)
-                results.check(f"Light {light_id} OFF: DMX G == 0", 0, dmx_g)
-                results.check(f"Light {light_id} OFF: DMX B == 0", 0, dmx_b)
-
-
-def test_light_color(api: HueAPI, light_id: str, listener: Optional[ArtNetListener],
-                     dmx_start: int, channel_map: dict, results: TestResult,
-                     settle_time: float):
-    """Test setting specific colors via CIE xy coordinates.
-
-    NOTE: The Hue Bridge gamut-maps xy coordinates before sending ZCL
-    commands, so the actual color the device receives may differ from
-    what we requested.  We verify:
-    1. The Bridge reports xy close to what we set
-    2. The DMX output shows a color change
-    3. The intended channel is significant (>100)
-    """
-    print(f"\n--- Test: COLOR for light #{light_id} ---")
-
-    # Test cases: (name, hue_xy, expected_significant_channel)
-    test_colors = [
-        ("Red",   [0.6750, 0.3220], "r"),  # Saturated red
-        ("Green", [0.4091, 0.5180], "g"),  # Saturated green
-        ("Blue",  [0.1670, 0.0400], "b"),  # Saturated blue
-    ]
-
-    # Ensure light is on at full brightness
-    api.set_light_state(light_id, {"on": True, "bri": 254})
-    time.sleep(0.5)
-
-    for color_name, xy, significant_ch in test_colors:
-        print(f"  Setting color: {color_name} (xy={xy})...")
-        api.set_light_state(light_id, {"xy": xy})
-        time.sleep(settle_time)
-
-        # Verify Hue reports the color (read back — Bridge may gamut-clip)
-        state = api.get_light(light_id).get("state", {})
-        reported_xy = state.get("xy", [0, 0])
-        results.check(f"Light {light_id} {color_name}: Hue xy[0] ~= {xy[0]:.3f}",
-                      xy[0], reported_xy[0], tolerance=0.05)
-        results.check(f"Light {light_id} {color_name}: Hue xy[1] ~= {xy[1]:.3f}",
-                      xy[1], reported_xy[1], tolerance=0.05)
-
-        if listener:
-            rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
-            if rgb is None:
-                results.check(f"Light {light_id} {color_name}: ArtNet received",
-                              True, False)
-                continue
-
-            dmx_r, dmx_g, dmx_b = rgb
-            print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b}")
-
-            channels = {"r": dmx_r, "g": dmx_g, "b": dmx_b}
-
-            # The intended channel should be significant (>100).
-            # Bridge gamut-mapping may cause other channels to also be
-            # high, so we don't assert it's the absolute maximum.
-            results.check(
-                f"Light {light_id} {color_name}: '{significant_ch}' channel > 100",
-                True, channels[significant_ch] > 100)
-
-            # At least one channel should be at full brightness (255)
-            max_val = max(channels.values())
-            results.check(
-                f"Light {light_id} {color_name}: max channel == 255",
-                True, max_val >= 250)
-
-
-def test_light_brightness(api: HueAPI, light_id: str, listener: Optional[ArtNetListener],
-                          dmx_start: int, channel_map: dict, results: TestResult,
-                          settle_time: float, light_type: str = "RGB"):
-    """Test brightness scaling."""
-    print(f"\n--- Test: BRIGHTNESS for light #{light_id} ---")
-    is_rgbw = (light_type == "RGBW")
-
-    # Set to white first
-    api.set_light_state(light_id, {"on": True, "bri": 254, "xy": [0.3127, 0.3290]})
-    time.sleep(settle_time)
-
-    brightness_levels = [254, 127, 1]
-
-    for bri in brightness_levels:
-        print(f"  Setting brightness={bri}...")
-        api.set_light_state(light_id, {"bri": bri})
-        time.sleep(settle_time)
-
-        state = api.get_light(light_id).get("state", {})
-        reported_bri = state.get("bri", 0)
-        results.check(f"Light {light_id} bri={bri}: Hue reports bri={bri}",
-                      bri, reported_bri, tolerance=1)
-
-        if listener:
-            if is_rgbw:
-                rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-                if rgbw is None:
-                    results.check(f"Light {light_id} bri={bri}: ArtNet received",
-                                  True, False)
-                    continue
-                dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-                print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
-
-                # For RGBW white, the W channel carries most of the output.
-                # W should be ~255 * (bri/254), RGB residual should be small.
-                expected_w_approx = int(255 * (bri / 254.0))
-                results.check(f"Light {light_id} bri={bri}: RGBW W ~= {expected_w_approx}",
-                              expected_w_approx, dmx_w, tolerance=20)
-            else:
-                rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
-                if rgb is None:
-                    results.check(f"Light {light_id} bri={bri}: ArtNet received",
-                                  True, False)
-                    continue
-
-                dmx_r, dmx_g, dmx_b = rgb
-                print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b}")
-
-                # For white, all channels should be roughly equal
-                # and scaled by brightness
-                # Firmware: dmx_val = rgb_val * (bri / 254.0)
-                # For white at full brightness, RGB from xyToRGB(0.3127, 0.3290)
-                # should be roughly (255, 255, 255), so:
-                expected_approx = int(255 * (bri / 254.0))
-                results.check(f"Light {light_id} bri={bri}: DMX R ~= {expected_approx}",
-                              expected_approx, dmx_r, tolerance=15)
-                results.check(f"Light {light_id} bri={bri}: DMX G ~= {expected_approx}",
-                              expected_approx, dmx_g, tolerance=15)
-
-
-def test_light_color_accuracy(api: HueAPI, light_id: str,
-                               listener: Optional[ArtNetListener],
-                               dmx_start: int, channel_map: dict,
-                               results: TestResult, settle_time: float,
-                               device_ip: Optional[str] = None,
-                               light_index: int = 0):
-    """
-    Test that the color pipeline from Hue API -> Zigbee -> DMX is consistent.
-
-    IMPORTANT: The Hue Bridge gamut-maps xy coordinates before sending ZCL
-    commands, and the ZCL values may differ significantly from the REST API
-    values.  We therefore query the device's own /api/lights/state to get
-    the RGB the firmware actually computed, and verify the ArtNet DMX output
-    matches that.  This tests: device state -> DMX output fidelity.
-    """
-    print(f"\n--- Test: COLOR ACCURACY for light #{light_id} ---")
-
-    api.set_light_state(light_id, {"on": True, "bri": 254})
-    time.sleep(0.5)
-
-    # Test cases: (name, requested_xy)
-    test_cases = [
-        ("White D65",   [0.3127, 0.3290]),
-        ("Red",         [0.6750, 0.3220]),
-        ("Green",       [0.4091, 0.5180]),
-        ("Blue",        [0.1670, 0.0400]),
-        ("Warm White",  [0.4578, 0.4101]),
-        ("Magenta",     [0.3833, 0.1591]),
-    ]
-
-    for name, xy in test_cases:
-        print(f"  Testing {name} (requested xy={xy})...")
-        api.set_light_state(light_id, {"xy": xy})
-        time.sleep(settle_time)
-
-        if not listener:
-            continue
-
-        # Read the device's own computed RGB (what it received via ZCL)
-        device_rgb = None
-        if device_ip:
-            dev_state = get_device_light_state(device_ip)
-            if dev_state and light_index < len(dev_state):
-                ls = dev_state[light_index]
-                device_rgb = (ls.get("r", 0), ls.get("g", 0), ls.get("b", 0))
-                print(f"    Device reports RGB: R={device_rgb[0]} G={device_rgb[1]} "
-                      f"B={device_rgb[2]} (on={ls.get('on')}, bri={ls.get('bri')})")
-
-        rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
-        if rgb is None:
-            results.check(f"Light {light_id} {name}: ArtNet received", True, False)
-            continue
-
-        dmx_r, dmx_g, dmx_b = rgb
-        print(f"    ArtNet   DMX: R={dmx_r} G={dmx_g} B={dmx_b}")
-
-        if device_rgb:
-            # Compare ArtNet output against what the device itself reports
-            exp_dmx_r, exp_dmx_g, exp_dmx_b = device_rgb
-            print(f"    Expected DMX: R={exp_dmx_r} G={exp_dmx_g} B={exp_dmx_b} "
-                  f"(from device state)")
-            results.check(f"Light {light_id} {name}: R accuracy",
-                          exp_dmx_r, dmx_r, tolerance=3)
-            results.check(f"Light {light_id} {name}: G accuracy",
-                          exp_dmx_g, dmx_g, tolerance=3)
-            results.check(f"Light {light_id} {name}: B accuracy",
-                          exp_dmx_b, dmx_b, tolerance=3)
-        else:
-            # Fallback: compute from Bridge-reported xy (less accurate)
-            state = api.get_light(light_id).get("state", {})
-            reported_xy = state.get("xy", xy)
-            reported_bri = state.get("bri", 254)
-            exp_r, exp_g, exp_b = cie_xy_to_rgb(reported_xy[0], reported_xy[1])
-            bri_scale = reported_bri / 254.0
-            exp_dmx_r = int(exp_r * bri_scale)
-            exp_dmx_g = int(exp_g * bri_scale)
-            exp_dmx_b = int(exp_b * bri_scale)
-            print(f"    Expected DMX: R={exp_dmx_r} G={exp_dmx_g} B={exp_dmx_b} "
-                  f"(from Bridge xy, less reliable)")
-            results.check(f"Light {light_id} {name}: R accuracy",
-                          exp_dmx_r, dmx_r, tolerance=15)
-            results.check(f"Light {light_id} {name}: G accuracy",
-                          exp_dmx_g, dmx_g, tolerance=15)
-            results.check(f"Light {light_id} {name}: B accuracy",
-                          exp_dmx_b, dmx_b, tolerance=15)
-
-
 def mirek_to_rgb(mirek: int) -> tuple:
     """
     Convert mirek (color temperature) to RGB.
@@ -1069,14 +336,307 @@ def mirek_to_rgb(mirek: int) -> tuple:
     return (r, g, b)
 
 
-def test_light_color_temperature(api: HueAPI, light_id: str,
-                                  listener: Optional[ArtNetListener],
-                                  dmx_start: int, channel_map: dict,
-                                  results: TestResult, settle_time: float,
-                                  light_type: str = "RGB"):
+def decompose_rgbw(r: int, g: int, b: int) -> tuple:
+    """
+    RGB-to-RGBW decomposition: extract the white component.
+    Matches firmware's decomposeRGBW() in zigbee_manager.cpp.
+
+    The white component is min(R, G, B), subtracted from each RGB channel.
+    Returns (r', g', b', w).
+    """
+    w = min(r, g, b)
+    return (r - w, g - w, b - w, w)
+
+
+# ---------------------------------------------------------------------------
+#  Test helpers
+# ---------------------------------------------------------------------------
+
+def find_device_lights(api: HueAPI, device_eui64: Optional[str] = None,
+                       manufacturer: str = DEVICE_MANUFACTURER) -> dict:
+    """
+    Find Hue light IDs belonging to our device.
+    Returns {hue_light_id: light_data} for matching lights.
+    """
+    all_lights = api.get_lights()
+    matches = {}
+    for lid, light in all_lights.items():
+        mfr = light.get("manufacturername", "")
+        uid = light.get("uniqueid", "")
+        if mfr == manufacturer:
+            matches[lid] = light
+        elif device_eui64 and device_eui64.lower().replace(":", "") in uid.lower().replace(":", "").replace("-", ""):
+            matches[lid] = light
+    return matches
+
+
+class TestResult:
+    """Collects pass/fail results."""
+
+    def __init__(self):
+        self.tests = []
+        self.passed = 0
+        self.failed = 0
+
+    def check(self, name: str, expected, actual, tolerance: int = RGB_TOLERANCE):
+        """Check a single value with tolerance."""
+        if isinstance(expected, tuple) and isinstance(actual, tuple):
+            ok = all(abs(e - a) <= tolerance for e, a in zip(expected, actual))
+        elif isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+            ok = abs(expected - actual) <= tolerance
+        else:
+            ok = (expected == actual)
+
+        status = "PASS" if ok else "FAIL"
+        self.tests.append((name, status, expected, actual))
+        if ok:
+            self.passed += 1
+        else:
+            self.failed += 1
+        return ok
+
+    def summary(self):
+        print()
+        print("=" * 60)
+        print(f"  TEST RESULTS: {self.passed} passed, {self.failed} failed, "
+              f"{self.passed + self.failed} total")
+        print("=" * 60)
+        for name, status, expected, actual in self.tests:
+            icon = "PASS" if status == "PASS" else "FAIL"
+            print(f"  [{icon}] {name}")
+            if status == "FAIL":
+                print(f"         expected: {expected}")
+                print(f"         actual:   {actual}")
+        print()
+        return self.failed == 0
+
+
+# ---------------------------------------------------------------------------
+#  Test scenarios — Hue API -> device state verification
+# ---------------------------------------------------------------------------
+
+def test_light_on_off(api: HueAPI, light_id: str, device_ip: str,
+                      light_index: int, results: TestResult,
+                      settle_time: float, light_type: str = "RGB"):
+    """Test turning a light on and off, verifying via device state API."""
+    print(f"\n--- Test: ON/OFF for light #{light_id} ---")
+
+    # Turn ON, full brightness, white
+    print("  Setting light ON, brightness=254, white...")
+    api.set_light_state(light_id, {"on": True, "bri": 254, "xy": [0.3127, 0.3290]})
+    time.sleep(settle_time)
+
+    state = api.get_light(light_id).get("state", {})
+    results.check(f"Light {light_id} ON: Hue reports on=True",
+                  True, state.get("on"))
+
+    # Verify device state
+    dev_state = get_device_light_state(device_ip)
+    if dev_state and light_index < len(dev_state):
+        ls = dev_state[light_index]
+        print(f"  Device state: on={ls.get('on')}, bri={ls.get('bri')}, "
+              f"R={ls.get('r')} G={ls.get('g')} B={ls.get('b')} W={ls.get('w')}")
+        results.check(f"Light {light_id} ON: device reports on=true",
+                      True, ls.get("on"))
+
+        if light_type == "RGBW":
+            # For RGBW white, most output is on W channel
+            results.check(f"Light {light_id} ON: RGBW W channel > 200",
+                          True, ls.get("w", 0) > 200)
+        else:
+            # White at full brightness should have high values on all channels
+            results.check(f"Light {light_id} ON: R > 200", True, ls.get("r", 0) > 200)
+            results.check(f"Light {light_id} ON: G > 200", True, ls.get("g", 0) > 200)
+            results.check(f"Light {light_id} ON: B > 200", True, ls.get("b", 0) > 200)
+    else:
+        results.check(f"Light {light_id} ON: device state readable", True, False)
+
+    # Turn OFF
+    print("  Setting light OFF...")
+    api.set_light_state(light_id, {"on": False})
+    time.sleep(settle_time)
+
+    state = api.get_light(light_id).get("state", {})
+    results.check(f"Light {light_id} OFF: Hue reports on=False",
+                  False, state.get("on"))
+
+    dev_state = get_device_light_state(device_ip)
+    if dev_state and light_index < len(dev_state):
+        ls = dev_state[light_index]
+        print(f"  Device state: on={ls.get('on')}")
+        results.check(f"Light {light_id} OFF: device reports on=false",
+                      False, ls.get("on"))
+
+
+def test_light_color(api: HueAPI, light_id: str, device_ip: str,
+                     light_index: int, results: TestResult,
+                     settle_time: float):
+    """Test setting specific colors via CIE xy coordinates.
+
+    NOTE: The Hue Bridge gamut-maps xy coordinates before sending ZCL
+    commands, so the actual color the device receives may differ from
+    what we requested.  We verify:
+    1. The Bridge reports xy close to what we set
+    2. The device state shows the intended channel is significant (>100)
+    3. At least one channel is at full brightness (255)
+    """
+    print(f"\n--- Test: COLOR for light #{light_id} ---")
+
+    # Test cases: (name, hue_xy, expected_significant_channel)
+    test_colors = [
+        ("Red",   [0.6750, 0.3220], "r"),  # Saturated red
+        ("Green", [0.4091, 0.5180], "g"),  # Saturated green
+        ("Blue",  [0.1670, 0.0400], "b"),  # Saturated blue
+    ]
+
+    # Ensure light is on at full brightness
+    api.set_light_state(light_id, {"on": True, "bri": 254})
+    time.sleep(0.5)
+
+    for color_name, xy, significant_ch in test_colors:
+        print(f"  Setting color: {color_name} (xy={xy})...")
+        api.set_light_state(light_id, {"xy": xy})
+        time.sleep(settle_time)
+
+        # Verify Hue reports the color (read back — Bridge may gamut-clip)
+        state = api.get_light(light_id).get("state", {})
+        reported_xy = state.get("xy", [0, 0])
+        results.check(f"Light {light_id} {color_name}: Hue xy[0] ~= {xy[0]:.3f}",
+                      xy[0], reported_xy[0], tolerance=0)
+        results.check(f"Light {light_id} {color_name}: Hue xy[1] ~= {xy[1]:.3f}",
+                      xy[1], reported_xy[1], tolerance=0)
+
+        # Verify device state
+        dev_state = get_device_light_state(device_ip)
+        if dev_state and light_index < len(dev_state):
+            ls = dev_state[light_index]
+            dev_r, dev_g, dev_b = ls.get("r", 0), ls.get("g", 0), ls.get("b", 0)
+            print(f"    Device state: R={dev_r} G={dev_g} B={dev_b}")
+
+            channels = {"r": dev_r, "g": dev_g, "b": dev_b}
+
+            # The intended channel should be significant (>100)
+            results.check(
+                f"Light {light_id} {color_name}: '{significant_ch}' channel > 100",
+                True, channels[significant_ch] > 100)
+
+            # At least one channel should be at full brightness (255)
+            max_val = max(channels.values())
+            results.check(
+                f"Light {light_id} {color_name}: max channel == 255",
+                True, max_val >= 250)
+        else:
+            results.check(f"Light {light_id} {color_name}: device state readable",
+                          True, False)
+
+
+def test_light_brightness(api: HueAPI, light_id: str, device_ip: str,
+                          light_index: int, results: TestResult,
+                          settle_time: float, light_type: str = "RGB"):
+    """Test brightness scaling via the device's reported brightness."""
+    print(f"\n--- Test: BRIGHTNESS for light #{light_id} ---")
+
+    # Set to white first
+    api.set_light_state(light_id, {"on": True, "bri": 254, "xy": [0.3127, 0.3290]})
+    time.sleep(settle_time)
+
+    brightness_levels = [254, 127, 1]
+
+    for bri in brightness_levels:
+        print(f"  Setting brightness={bri}...")
+        api.set_light_state(light_id, {"bri": bri})
+        time.sleep(settle_time)
+
+        state = api.get_light(light_id).get("state", {})
+        reported_bri = state.get("bri", 0)
+        results.check(f"Light {light_id} bri={bri}: Hue reports bri={bri}",
+                      bri, reported_bri, tolerance=1)
+
+        # Verify device state reflects the brightness
+        dev_state = get_device_light_state(device_ip)
+        if dev_state and light_index < len(dev_state):
+            ls = dev_state[light_index]
+            dev_bri = ls.get("bri", 0)
+            print(f"    Device: bri={dev_bri}, R={ls.get('r')} G={ls.get('g')} "
+                  f"B={ls.get('b')} W={ls.get('w')}")
+            results.check(f"Light {light_id} bri={bri}: device bri ~= {bri}",
+                          bri, dev_bri, tolerance=1)
+        else:
+            results.check(f"Light {light_id} bri={bri}: device state readable",
+                          True, False)
+
+
+def test_light_color_accuracy(api: HueAPI, light_id: str, device_ip: str,
+                              light_index: int, results: TestResult,
+                              settle_time: float):
+    """
+    Test that the color pipeline from Hue API -> Zigbee -> device state
+    produces colors consistent with the firmware's xyToRGB conversion.
+
+    IMPORTANT: The Hue Bridge gamut-maps xy coordinates before sending ZCL
+    commands, so the actual ZCL values may differ from what we requested.
+    We query the device's own /api/lights/state to get the RGB the firmware
+    actually computed, and compare against Bridge-reported xy.
+    """
+    print(f"\n--- Test: COLOR ACCURACY for light #{light_id} ---")
+
+    api.set_light_state(light_id, {"on": True, "bri": 254})
+    time.sleep(0.5)
+
+    # Test cases: (name, requested_xy)
+    test_cases = [
+        ("White D65",   [0.3127, 0.3290]),
+        ("Red",         [0.6750, 0.3220]),
+        ("Green",       [0.4091, 0.5180]),
+        ("Blue",        [0.1670, 0.0400]),
+        ("Warm White",  [0.4578, 0.4101]),
+        ("Magenta",     [0.3833, 0.1591]),
+    ]
+
+    for name, xy in test_cases:
+        print(f"  Testing {name} (requested xy={xy})...")
+        api.set_light_state(light_id, {"xy": xy})
+        time.sleep(settle_time)
+
+        # Read the device's own computed RGB (what it received via ZCL)
+        dev_state = get_device_light_state(device_ip)
+        if not dev_state or light_index >= len(dev_state):
+            results.check(f"Light {light_id} {name}: device state readable",
+                          True, False)
+            continue
+
+        ls = dev_state[light_index]
+        dev_r = ls.get("r", 0)
+        dev_g = ls.get("g", 0)
+        dev_b = ls.get("b", 0)
+        print(f"    Device reports RGB: R={dev_r} G={dev_g} B={dev_b} "
+              f"(on={ls.get('on')}, bri={ls.get('bri')})")
+
+        # Compute expected from Bridge-reported xy (may differ from requested
+        # due to gamut mapping, but should be in the same ballpark)
+        state = api.get_light(light_id).get("state", {})
+        reported_xy = state.get("xy", xy)
+        exp_r, exp_g, exp_b = cie_xy_to_rgb(reported_xy[0], reported_xy[1])
+        print(f"    Expected RGB (from Bridge xy={reported_xy}): "
+              f"R={exp_r} G={exp_g} B={exp_b}")
+
+        # Device RGB should be reasonably close to what xyToRGB produces
+        # from the Bridge-reported xy (tolerance is wider because the Bridge
+        # gamut-maps before sending ZCL, and ZCL precision is limited)
+        results.check(f"Light {light_id} {name}: R accuracy",
+                      exp_r, dev_r, tolerance=15)
+        results.check(f"Light {light_id} {name}: G accuracy",
+                      exp_g, dev_g, tolerance=15)
+        results.check(f"Light {light_id} {name}: B accuracy",
+                      exp_b, dev_b, tolerance=15)
+
+
+def test_light_color_temperature(api: HueAPI, light_id: str, device_ip: str,
+                                 light_index: int, results: TestResult,
+                                 settle_time: float, light_type: str = "RGB"):
     """
     Test color temperature (mirek) control via the Hue API 'ct' parameter.
-    Verifies that the firmware's mirekToRGB conversion produces expected DMX values.
+    Verifies that the firmware's mirekToRGB conversion produces expected values.
     For RGBW lights, accounts for white channel decomposition.
     """
     print(f"\n--- Test: COLOR TEMPERATURE for light #{light_id} ---")
@@ -1112,7 +672,7 @@ def test_light_color_temperature(api: HueAPI, light_id: str,
         print(f"  Setting CT={mirek} mirek ({desc})...")
         response = api.set_light_state(light_id, {"ct": mirek})
 
-        # Check if the Hue API reported an error (e.g. parameter not available)
+        # Check if the Hue API reported an error
         has_error = False
         if isinstance(response, list):
             for item in response:
@@ -1138,89 +698,79 @@ def test_light_color_temperature(api: HueAPI, light_id: str,
         results.check(f"Light {light_id} CT {name}: Hue reports ct ~= {mirek}",
                       mirek, reported_ct, tolerance=5)
 
-        if not listener:
-            continue
-
         # Compute expected RGB from our Python port of the firmware
         exp_r, exp_g, exp_b = mirek_to_rgb(mirek)
 
-        if is_rgbw:
-            rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-            if rgbw is None:
-                results.check(f"Light {light_id} CT {name}: ArtNet received",
-                              True, False)
-                continue
+        # Read device state
+        dev_state = get_device_light_state(device_ip)
+        if not dev_state or light_index >= len(dev_state):
+            results.check(f"Light {light_id} CT {name}: device state readable",
+                          True, False)
+            continue
 
-            dmx_r, dmx_g, dmx_b, dmx_w = rgbw
+        ls = dev_state[light_index]
+
+        if is_rgbw:
+            dev_r = ls.get("r", 0)
+            dev_g = ls.get("g", 0)
+            dev_b = ls.get("b", 0)
+            dev_w = ls.get("w", 0)
 
             # Apply decomposition to expected values
             exp_r2, exp_g2, exp_b2, exp_w = decompose_rgbw(exp_r, exp_g, exp_b)
 
-            print(f"    Expected DMX: R={exp_r2} G={exp_g2} B={exp_b2} W={exp_w}")
-            print(f"    Actual   DMX: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
+            print(f"    Expected: R={exp_r2} G={exp_g2} B={exp_b2} W={exp_w}")
+            print(f"    Device:   R={dev_r} G={dev_g} B={dev_b} W={dev_w}")
 
             results.check(f"Light {light_id} CT {name}: R accuracy",
-                          exp_r2, dmx_r, tolerance=10)
+                          exp_r2, dev_r, tolerance=10)
             results.check(f"Light {light_id} CT {name}: G accuracy",
-                          exp_g2, dmx_g, tolerance=10)
+                          exp_g2, dev_g, tolerance=10)
             results.check(f"Light {light_id} CT {name}: B accuracy",
-                          exp_b2, dmx_b, tolerance=10)
+                          exp_b2, dev_b, tolerance=10)
             results.check(f"Light {light_id} CT {name}: W accuracy",
-                          exp_w, dmx_w, tolerance=10)
+                          exp_w, dev_w, tolerance=10)
 
             # Verify warm is more red-dominant, cool has high W
             if mirek >= 370:
                 results.check(f"Light {light_id} CT {name}: warm has R > B",
-                              True, dmx_r >= dmx_b)
+                              True, dev_r >= dev_b)
             elif mirek <= 200:
                 results.check(f"Light {light_id} CT {name}: cool has high W",
-                              True, dmx_w > 150)
+                              True, dev_w > 150)
         else:
-            rgb = read_dmx_rgb(listener, dmx_start, channel_map, settle_time)
-            if rgb is None:
-                results.check(f"Light {light_id} CT {name}: ArtNet received",
-                              True, False)
-                continue
+            dev_r = ls.get("r", 0)
+            dev_g = ls.get("g", 0)
+            dev_b = ls.get("b", 0)
 
-            dmx_r, dmx_g, dmx_b = rgb
-
-            print(f"    Expected DMX: R={exp_r} G={exp_g} B={exp_b}")
-            print(f"    Actual   DMX: R={dmx_r} G={dmx_g} B={dmx_b}")
+            print(f"    Expected: R={exp_r} G={exp_g} B={exp_b}")
+            print(f"    Device:   R={dev_r} G={dev_g} B={dev_b}")
 
             results.check(f"Light {light_id} CT {name}: R accuracy",
-                          exp_r, dmx_r, tolerance=10)
+                          exp_r, dev_r, tolerance=10)
             results.check(f"Light {light_id} CT {name}: G accuracy",
-                          exp_g, dmx_g, tolerance=10)
+                          exp_g, dev_g, tolerance=10)
             results.check(f"Light {light_id} CT {name}: B accuracy",
-                          exp_b, dmx_b, tolerance=10)
+                          exp_b, dev_b, tolerance=10)
 
             # Verify warm is more red, cool is more blue
             if mirek >= 370:
                 results.check(f"Light {light_id} CT {name}: warm has R > B",
-                              True, dmx_r >= dmx_b)
+                              True, dev_r >= dev_b)
             elif mirek <= 200:
                 results.check(f"Light {light_id} CT {name}: cool has B > 0",
-                              True, dmx_b > 50)
+                              True, dev_b > 50)
 
 
-def test_rgbw_decomposition(api: HueAPI, light_id: str,
-                             listener: Optional[ArtNetListener],
-                             dmx_start: int, channel_map: dict,
-                             results: TestResult, settle_time: float,
-                             device_ip: Optional[str] = None,
-                             light_index: int = 0):
+def test_rgbw_decomposition(api: HueAPI, light_id: str, device_ip: str,
+                            light_index: int, results: TestResult,
+                            settle_time: float):
     """
-    Test RGB-to-RGBW white channel decomposition via ArtNet output.
+    Test RGB-to-RGBW white channel decomposition via device state.
 
     For RGBW lights, the firmware decomposes RGB into RGBW by extracting
     the white component: W = min(R,G,B), then R'=R-W, G'=G-W, B'=B-W.
-    This test verifies that the 4th DMX channel (white) is correctly populated.
-
-    Key test cases:
-    - Pure white (R=G=B=255) -> R'=0, G'=0, B'=0, W=255
-    - Saturated red (R=255, G~=0, B~=0) -> R'=255, G'=0, B'=0, W~=0
-    - Pastel / desaturated color -> non-zero W extracted
-    - Color temperature -> warm whites should decompose with high W
+    This test verifies the white channel is correctly populated.
     """
     print(f"\n--- Test: RGBW DECOMPOSITION for light #{light_id} ---")
 
@@ -1228,114 +778,88 @@ def test_rgbw_decomposition(api: HueAPI, light_id: str,
     api.set_light_state(light_id, {"on": True, "bri": 254})
     time.sleep(0.5)
 
-    if not listener:
-        print("  SKIP: No ArtNet listener (RGBW tests require ArtNet)")
-        return
-
     # ---- Test 1: Pure white -> all white channel, no RGB ----
     print("  Test 1: Pure white (xy=D65) -> W=max, RGB=0")
     api.set_light_state(light_id, {"on": True, "bri": 254, "xy": [0.3127, 0.3290]})
     time.sleep(settle_time)
 
-    rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-    if rgbw is None:
-        results.check(f"Light {light_id} RGBW white: ArtNet received", True, False)
-    else:
-        dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-        print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
+    dev_state = get_device_light_state(device_ip)
+    if dev_state and light_index < len(dev_state):
+        ls = dev_state[light_index]
+        dev_r, dev_g, dev_b, dev_w = (ls.get("r", 0), ls.get("g", 0),
+                                      ls.get("b", 0), ls.get("w", 0))
+        print(f"    Device: R={dev_r} G={dev_g} B={dev_b} W={dev_w}")
 
-        # For pure white, the device receives R=G=B=255 from xyToRGB.
-        # Decomposition: W=255, R'=0, G'=0, B'=0.
-        # After brightness scaling (254/254 ~ 1.0): expect W~=255, RGB~=0.
-        # However, the actual values depend on what the Bridge sends via ZCL
-        # (gamut mapping may shift xy). We verify via device state if available.
-        if device_ip:
-            dev_state = get_device_light_state(device_ip)
-            if dev_state and light_index < len(dev_state):
-                ls = dev_state[light_index]
-                dev_r = ls.get("r", 0)
-                dev_g = ls.get("g", 0)
-                dev_b = ls.get("b", 0)
-                dev_w = ls.get("w", 0)
-                print(f"    Device reports: R={dev_r} G={dev_g} B={dev_b} W={dev_w}")
-                results.check(f"Light {light_id} RGBW white: DMX R matches device",
-                              dev_r, dmx_r, tolerance=3)
-                results.check(f"Light {light_id} RGBW white: DMX G matches device",
-                              dev_g, dmx_g, tolerance=3)
-                results.check(f"Light {light_id} RGBW white: DMX B matches device",
-                              dev_b, dmx_b, tolerance=3)
-                results.check(f"Light {light_id} RGBW white: DMX W matches device",
-                              dev_w, dmx_w, tolerance=3)
-
-        # White channel should be high (> 200)
         results.check(f"Light {light_id} RGBW white: W channel > 200",
-                      True, dmx_w > 200)
-        # RGB channels should be low (white is fully extracted)
-        # Note: gamut mapping may not give perfect R=G=B from xy D65,
-        # so the residual RGB might not be exactly 0 but should be small
+                      True, dev_w > 200)
         results.check(f"Light {light_id} RGBW white: R channel < 30",
-                      True, dmx_r < 30)
+                      True, dev_r < 30)
         results.check(f"Light {light_id} RGBW white: G channel < 30",
-                      True, dmx_g < 30)
+                      True, dev_g < 30)
         results.check(f"Light {light_id} RGBW white: B channel < 30",
-                      True, dmx_b < 30)
+                      True, dev_b < 30)
+    else:
+        results.check(f"Light {light_id} RGBW white: device state readable",
+                      True, False)
 
     # ---- Test 2: Saturated red -> no white channel ----
     print("  Test 2: Saturated red -> W=0, R=max")
     api.set_light_state(light_id, {"on": True, "bri": 254, "xy": [0.6750, 0.3220]})
     time.sleep(settle_time)
 
-    rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-    if rgbw is None:
-        results.check(f"Light {light_id} RGBW red: ArtNet received", True, False)
-    else:
-        dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-        print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
+    dev_state = get_device_light_state(device_ip)
+    if dev_state and light_index < len(dev_state):
+        ls = dev_state[light_index]
+        dev_r, dev_w = ls.get("r", 0), ls.get("w", 0)
+        print(f"    Device: R={dev_r} G={ls.get('g')} B={ls.get('b')} W={dev_w}")
 
-        # Saturated red: R=255, G~=0, B~=0 -> W=min(255,~0,~0)=~0
         results.check(f"Light {light_id} RGBW red: R channel > 200",
-                      True, dmx_r > 200)
-        # White should be very low for saturated colors
+                      True, dev_r > 200)
         results.check(f"Light {light_id} RGBW red: W channel < 30",
-                      True, dmx_w < 30)
+                      True, dev_w < 30)
+    else:
+        results.check(f"Light {light_id} RGBW red: device state readable",
+                      True, False)
 
     # ---- Test 3: Saturated green -> no white channel ----
     print("  Test 3: Saturated green -> W low, G=max")
     api.set_light_state(light_id, {"on": True, "bri": 254, "xy": [0.4091, 0.5180]})
     time.sleep(settle_time)
 
-    rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-    if rgbw is None:
-        results.check(f"Light {light_id} RGBW green: ArtNet received", True, False)
-    else:
-        dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-        print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
+    dev_state = get_device_light_state(device_ip)
+    if dev_state and light_index < len(dev_state):
+        ls = dev_state[light_index]
+        dev_g, dev_w = ls.get("g", 0), ls.get("w", 0)
+        print(f"    Device: R={ls.get('r')} G={dev_g} B={ls.get('b')} W={dev_w}")
 
         results.check(f"Light {light_id} RGBW green: G channel > 200",
-                      True, dmx_g > 200)
-        # White should be low for saturated colors
+                      True, dev_g > 200)
         results.check(f"Light {light_id} RGBW green: W channel < 50",
-                      True, dmx_w < 50)
+                      True, dev_w < 50)
+    else:
+        results.check(f"Light {light_id} RGBW green: device state readable",
+                      True, False)
 
     # ---- Test 4: Saturated blue -> no white channel ----
     print("  Test 4: Saturated blue -> W low, B=max")
     api.set_light_state(light_id, {"on": True, "bri": 254, "xy": [0.1670, 0.0400]})
     time.sleep(settle_time)
 
-    rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-    if rgbw is None:
-        results.check(f"Light {light_id} RGBW blue: ArtNet received", True, False)
-    else:
-        dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-        print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
+    dev_state = get_device_light_state(device_ip)
+    if dev_state and light_index < len(dev_state):
+        ls = dev_state[light_index]
+        dev_b, dev_w = ls.get("b", 0), ls.get("w", 0)
+        print(f"    Device: R={ls.get('r')} G={ls.get('g')} B={dev_b} W={dev_w}")
 
         results.check(f"Light {light_id} RGBW blue: B channel > 200",
-                      True, dmx_b > 200)
+                      True, dev_b > 200)
         results.check(f"Light {light_id} RGBW blue: W channel < 30",
-                      True, dmx_w < 30)
+                      True, dev_w < 30)
+    else:
+        results.check(f"Light {light_id} RGBW blue: device state readable",
+                      True, False)
 
     # ---- Test 5: Warm white via color temperature -> high W ----
-    # Check if the bridge supports CT for this light first
     light_info = api.get_light(light_id)
     ct_cap = light_info.get("capabilities", {}).get("control", {}).get("ct")
     if ct_cap is not None:
@@ -1343,39 +867,31 @@ def test_rgbw_decomposition(api: HueAPI, light_id: str,
         api.set_light_state(light_id, {"on": True, "bri": 254, "ct": 370})
         time.sleep(settle_time)
 
-        rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-        if rgbw is None:
-            results.check(f"Light {light_id} RGBW warm CT: ArtNet received",
-                          True, False)
-        else:
-            dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-            print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
+        dev_state = get_device_light_state(device_ip)
+        if dev_state and light_index < len(dev_state):
+            ls = dev_state[light_index]
+            dev_r, dev_g, dev_b, dev_w = (ls.get("r", 0), ls.get("g", 0),
+                                          ls.get("b", 0), ls.get("w", 0))
+            print(f"    Device: R={dev_r} G={dev_g} B={dev_b} W={dev_w}")
 
-            # Warm white (2703K) from mirekToRGB gives R=255 G=168 B=71.
-            # Decomposition: W=71, R'=184, G'=97, B'=0.
-            # The white channel should be meaningful (> 30)
             results.check(f"Light {light_id} RGBW warm CT: W channel > 30",
-                          True, dmx_w > 30)
-            # R+W combined should represent warm tone (R dominant)
+                          True, dev_w > 30)
             results.check(f"Light {light_id} RGBW warm CT: R+W > G+W (warm tone)",
-                          True, (dmx_r + dmx_w) >= (dmx_g + dmx_w))
+                          True, (dev_r + dev_w) >= (dev_g + dev_w))
 
         print("  Test 6: Cool daylight via CT=153 -> W present")
         api.set_light_state(light_id, {"on": True, "bri": 254, "ct": 153})
         time.sleep(settle_time)
 
-        rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-        if rgbw is None:
-            results.check(f"Light {light_id} RGBW cool CT: ArtNet received",
-                          True, False)
-        else:
-            dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-            print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
+        dev_state = get_device_light_state(device_ip)
+        if dev_state and light_index < len(dev_state):
+            ls = dev_state[light_index]
+            dev_w = ls.get("w", 0)
+            print(f"    Device: R={ls.get('r')} G={ls.get('g')} "
+                  f"B={ls.get('b')} W={dev_w}")
 
-            # Cool daylight (6536K) from mirekToRGB gives R=255 G=249 B=253.
-            # Decomposition: W=249, R'=6, G'=0, B'=4. High white content.
             results.check(f"Light {light_id} RGBW cool CT: W channel > 150",
-                          True, dmx_w > 150)
+                          True, dev_w > 150)
     else:
         print("  SKIP: Tests 5-6 (CT not supported by bridge for this light)")
 
@@ -1384,56 +900,46 @@ def test_rgbw_decomposition(api: HueAPI, light_id: str,
     api.set_light_state(light_id, {"on": False})
     time.sleep(settle_time)
 
-    rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-    if rgbw is None:
-        results.check(f"Light {light_id} RGBW off: ArtNet received", True, False)
-    else:
-        dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-        print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
-        results.check(f"Light {light_id} RGBW off: R == 0", 0, dmx_r)
-        results.check(f"Light {light_id} RGBW off: G == 0", 0, dmx_g)
-        results.check(f"Light {light_id} RGBW off: B == 0", 0, dmx_b)
-        results.check(f"Light {light_id} RGBW off: W == 0", 0, dmx_w)
+    dev_state = get_device_light_state(device_ip)
+    if dev_state and light_index < len(dev_state):
+        ls = dev_state[light_index]
+        print(f"    Device: on={ls.get('on')}")
+        results.check(f"Light {light_id} RGBW off: device reports on=false",
+                      False, ls.get("on"))
 
     # ---- Test 8: Half brightness white -> W scaled, RGB low ----
     print("  Test 8: Half brightness white -> W scaled")
     api.set_light_state(light_id, {"on": True, "bri": 127, "xy": [0.3127, 0.3290]})
     time.sleep(settle_time)
 
-    rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-    if rgbw is None:
-        results.check(f"Light {light_id} RGBW half-bri: ArtNet received", True, False)
-    else:
-        dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-        print(f"    ArtNet DMX: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
+    dev_state = get_device_light_state(device_ip)
+    if dev_state and light_index < len(dev_state):
+        ls = dev_state[light_index]
+        dev_r, dev_w, dev_bri = ls.get("r", 0), ls.get("w", 0), ls.get("bri", 0)
+        print(f"    Device: R={dev_r} G={ls.get('g')} B={ls.get('b')} "
+              f"W={dev_w} bri={dev_bri}")
 
-        # At bri=127 (~50%), W should be roughly half of full brightness W
-        # Full brightness W was ~255, so half should be ~127
-        results.check(f"Light {light_id} RGBW half-bri: W channel 90-160",
-                      True, 90 <= dmx_w <= 160)
-        # RGB should still be low (white extracted)
-        results.check(f"Light {light_id} RGBW half-bri: R channel < 20",
-                      True, dmx_r < 20)
+        # Brightness is reported separately — W should still be high
+        # (the device stores full-intensity color, brightness applied at output)
+        results.check(f"Light {light_id} RGBW half-bri: W channel > 200",
+                      True, dev_w > 200)
+        results.check(f"Light {light_id} RGBW half-bri: bri ~= 127",
+                      127, dev_bri, tolerance=1)
+        results.check(f"Light {light_id} RGBW half-bri: R channel < 30",
+                      True, dev_r < 30)
 
     # Restore
     api.set_light_state(light_id, {"on": True, "bri": 254, "xy": [0.3127, 0.3290]})
 
 
-def test_rgbw_accuracy(api: HueAPI, light_id: str,
-                        listener: Optional[ArtNetListener],
-                        dmx_start: int, channel_map: dict,
-                        results: TestResult, settle_time: float,
-                        device_ip: Optional[str] = None,
-                        light_index: int = 0):
+def test_rgbw_accuracy(api: HueAPI, light_id: str, device_ip: str,
+                       light_index: int, results: TestResult,
+                       settle_time: float):
     """
-    Test RGBW accuracy: verify ArtNet RGBW output matches the device's own
-    reported state (which includes the decomposed white channel).
+    Test RGBW accuracy: verify device-reported RGBW values match
+    expected decomposition for known colors.
     """
     print(f"\n--- Test: RGBW ACCURACY for light #{light_id} ---")
-
-    if not listener:
-        print("  SKIP: No ArtNet listener")
-        return
 
     api.set_light_state(light_id, {"on": True, "bri": 254})
     time.sleep(0.5)
@@ -1454,41 +960,36 @@ def test_rgbw_accuracy(api: HueAPI, light_id: str,
         time.sleep(settle_time)
 
         # Read device's own state (includes decomposed RGBW)
-        device_rgbw = None
-        if device_ip:
-            dev_state = get_device_light_state(device_ip)
-            if dev_state and light_index < len(dev_state):
-                ls = dev_state[light_index]
-                device_rgbw = (ls.get("r", 0), ls.get("g", 0),
-                               ls.get("b", 0), ls.get("w", 0))
-                print(f"    Device: R={device_rgbw[0]} G={device_rgbw[1]} "
-                      f"B={device_rgbw[2]} W={device_rgbw[3]}")
-
-        rgbw = read_dmx_rgbw(listener, dmx_start, channel_map, settle_time)
-        if rgbw is None:
-            results.check(f"Light {light_id} RGBW {name}: ArtNet received",
+        dev_state = get_device_light_state(device_ip)
+        if not dev_state or light_index >= len(dev_state):
+            results.check(f"Light {light_id} RGBW {name}: device state readable",
                           True, False)
             continue
 
-        dmx_r, dmx_g, dmx_b, dmx_w = rgbw
-        print(f"    ArtNet: R={dmx_r} G={dmx_g} B={dmx_b} W={dmx_w}")
+        ls = dev_state[light_index]
+        dev_r = ls.get("r", 0)
+        dev_g = ls.get("g", 0)
+        dev_b = ls.get("b", 0)
+        dev_w = ls.get("w", 0)
+        print(f"    Device: R={dev_r} G={dev_g} B={dev_b} W={dev_w}")
 
-        if device_rgbw:
-            exp_r, exp_g, exp_b, exp_w = device_rgbw
-            results.check(f"Light {light_id} RGBW {name}: R accuracy",
-                          exp_r, dmx_r, tolerance=3)
-            results.check(f"Light {light_id} RGBW {name}: G accuracy",
-                          exp_g, dmx_g, tolerance=3)
-            results.check(f"Light {light_id} RGBW {name}: B accuracy",
-                          exp_b, dmx_b, tolerance=3)
-            results.check(f"Light {light_id} RGBW {name}: W accuracy",
-                          exp_w, dmx_w, tolerance=3)
-        else:
-            # Without device state, just verify invariant: R+W, G+W, B+W
-            # should reconstruct a reasonable color
-            total = dmx_r + dmx_g + dmx_b + dmx_w
-            results.check(f"Light {light_id} RGBW {name}: total output > 0",
-                          True, total > 0)
+        # Verify decomposition invariant: original RGB can be reconstructed
+        # by adding W back to each channel
+        orig_r = dev_r + dev_w
+        orig_g = dev_g + dev_w
+        orig_b = dev_b + dev_w
+        print(f"    Reconstructed: R={orig_r} G={orig_g} B={orig_b}")
+
+        # The reconstructed values should form a valid color
+        # (at least one channel at 255 for full-brightness colors)
+        max_val = max(orig_r, orig_g, orig_b)
+        results.check(f"Light {light_id} RGBW {name}: reconstructed max >= 250",
+                      True, max_val >= 250)
+
+        # W should equal min of the reconstructed RGB (decomposition invariant)
+        expected_w = min(orig_r, orig_g, orig_b)
+        results.check(f"Light {light_id} RGBW {name}: W == min(R+W, G+W, B+W)",
+                      expected_w, dev_w, tolerance=1)
 
 
 # ---------------------------------------------------------------------------
@@ -1652,7 +1153,7 @@ def test_sse_initial_events(device_ip: str, results: TestResult,
                   f"zigbee={status.get('zigbee')}, "
                   f"lights={status.get('lightCount')}")
         except json.JSONDecodeError as e:
-            results.check(f"SSE initial: status is valid JSON", True, False)
+            results.check("SSE initial: status is valid JSON", True, False)
             print(f"  Bad JSON: {e}")
 
         # Second event should be 'lightstate'
@@ -1883,7 +1384,7 @@ def test_sse_reconnect(device_ip: str, results: TestResult,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Integration test: verify Hue API light states match ArtNet DMX output",
+        description="Integration test for Zigbee WLED Bridge",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
@@ -1892,18 +1393,13 @@ def main():
     parser.add_argument("--api-key",
                         help="Hue API key (loaded from .hue_api_key if omitted)")
     parser.add_argument("--device-ip",
-                        help="ESP32 Zigbee DMX Bridge IP for config/status queries")
+                        help="ESP32 Zigbee WLED Bridge IP")
     parser.add_argument("--light-id",
                         help="Hue light ID to test (auto-detected if --device-ip given)")
-    parser.add_argument("--listen-ip", default="0.0.0.0",
-                        help="IP to bind ArtNet listener (default: 0.0.0.0)")
-    parser.add_argument("--universe", type=int, default=0,
-                        help="ArtNet universe to listen on (default: 0)")
-    parser.add_argument("--skip-artnet", action="store_true",
-                        help="Skip ArtNet verification, only test Hue API round-trip")
     parser.add_argument("--settle-time", type=float, default=DEFAULT_SETTLE_TIME,
                         help=f"Seconds to wait after Hue command (default: {DEFAULT_SETTLE_TIME})")
-    parser.add_argument("--test", choices=["all", "onoff", "color", "brightness", "accuracy", "colortemp", "rgbw", "sse"],
+    parser.add_argument("--test", choices=["all", "onoff", "color", "brightness",
+                                           "accuracy", "colortemp", "rgbw", "sse"],
                         default="all",
                         help="Which test to run (default: all)")
 
@@ -1939,7 +1435,7 @@ def main():
 
     api = HueAPI(bridge_ip, api_key) if bridge_ip and api_key else None
 
-    # --- Configure device and identify lights ---
+    # --- Query device ---
     device_config = None
     device_eui64 = None
     light_ids = []
@@ -1950,32 +1446,19 @@ def main():
         device_status = get_device_status(args.device_ip)
         if device_status:
             device_eui64 = device_status.get("eui64")
+            zb_state = device_status.get("zigbee")
             print(f"  Device EUI64: {device_eui64}")
-            print(f"  Zigbee: {device_status.get('zigbee')}")
+            print(f"  Zigbee: {zb_state}")
 
-        # Ensure device is configured for ArtNet with test lights
-        if not args.skip_artnet:
-            device_config = configure_device_for_test(
-                args.device_ip, universe=args.universe,
-                listen_ip=args.listen_ip)
-            if device_config is None:
-                print("ERROR: Failed to configure device for testing.",
-                      file=sys.stderr)
-                sys.exit(1)
-            args.universe = device_config.get("output", {}).get(
-                "artnetUniverse", args.universe)
-        else:
-            # Just read the config without modifying it
-            device_config = get_device_config(args.device_ip)
-
+        # Read the device config
+        device_config = get_device_config(args.device_ip)
         if device_config:
             lights_cfg = device_config.get("lights", [])
-            output_cfg = device_config.get("output", {})
-            print(f"\n  Active config: {len(lights_cfg)} light(s), "
-                  f"mode={output_cfg.get('mode', 'dmx')}")
+            print(f"\n  Active config: {len(lights_cfg)} light(s)")
             for i, lc in enumerate(lights_cfg):
                 print(f"    [{i}] {lc.get('name')} type={lc.get('type')} "
-                      f"dmxAddr={lc.get('dmxAddr')} (endpoint {10 + i * 10})")
+                      f"host={lc.get('host')}:{lc.get('port')} "
+                      f"(endpoint {10 + i * 10})")
 
     # Find matching Hue lights
     if api:
@@ -2000,100 +1483,54 @@ def main():
             # Override with explicit light ID
             light_ids = [args.light_id]
 
-    # --- Build DMX mapping from device config ---
-    # Maps hue_light_id -> (dmx_start_addr, channel_map, light_type)
-    dmx_mappings = {}
+    # --- Build light type mapping from device config ---
+    light_types = {}
     if device_config:
         lights_cfg = device_config.get("lights", [])
-        # Match by index: light_ids[0] = lights_cfg[0], etc.
-        # This assumes the Hue lights are in endpoint order
         for i, lid in enumerate(light_ids):
             if i < len(lights_cfg):
-                lc = lights_cfg[i]
-                dmx_mappings[lid] = (
-                    lc.get("dmxAddr", 1),
-                    lc.get("channelMap", {"r": 0, "g": 1, "b": 2, "w": 3}),
-                    lc.get("type", "RGB")
-                )
+                light_types[lid] = lights_cfg[i].get("type", "RGB")
             else:
-                # Default mapping
-                dmx_mappings[lid] = (1 + i * 3, {"r": 0, "g": 1, "b": 2}, "RGB")
+                light_types[lid] = "RGB"
     else:
-        # No device config, assume default
-        for i, lid in enumerate(light_ids):
-            dmx_mappings[lid] = (1 + i * 3, {"r": 0, "g": 1, "b": 2}, "RGB")
-
-    # --- Start ArtNet listener ---
-    listener = None
-    if not args.skip_artnet:
-        print(f"\nStarting ArtNet listener (universe={args.universe})...")
-        listener = ArtNetListener(listen_ip=args.listen_ip, universe=args.universe)
-        try:
-            listener.start()
-        except OSError as e:
-            print(f"  WARNING: Could not start ArtNet listener: {e}")
-            print(f"  (Is another process using port {ARTNET_PORT}?)")
-            print(f"  Continuing without ArtNet verification.")
-            listener = None
-
-        if listener:
-            # Wait for initial packet
-            print("  Waiting for initial ArtNet packet...")
-            if listener.wait_for_packet(timeout=10):
-                print(f"  Received ArtNet from {listener.last_source_ip}")
-            else:
-                print("  ERROR: No ArtNet packets received within 10s.",
-                      file=sys.stderr)
-                print("  Is the device configured for ArtNet output?",
-                      file=sys.stderr)
-                print("  Use --skip-artnet to run without ArtNet verification.",
-                      file=sys.stderr)
-                listener.stop()
-                sys.exit(1)
+        for lid in light_ids:
+            light_types[lid] = "RGB"
 
     # --- Run tests ---
     results = TestResult()
 
     for light_index, lid in enumerate(light_ids):
-        if not api:
-            break  # Hue bridge tests require api
-        dmx_start, channel_map, light_type = dmx_mappings.get(
-            lid, (1, {"r": 0, "g": 1, "b": 2}, "RGB"))
+        if not api or not args.device_ip:
+            break  # Hue bridge tests require api + device IP
+        light_type = light_types.get(lid, "RGB")
         print(f"\n{'=' * 60}")
-        print(f"  TESTING LIGHT #{lid} (index={light_index}, type={light_type}, "
-              f"DMX start={dmx_start}, map={channel_map})")
+        print(f"  TESTING LIGHT #{lid} (index={light_index}, type={light_type})")
         print(f"{'=' * 60}")
 
         tests_to_run = args.test
         if tests_to_run in ("all", "onoff"):
-            test_light_on_off(api, lid, listener, dmx_start, channel_map,
+            test_light_on_off(api, lid, args.device_ip, light_index,
                               results, args.settle_time, light_type=light_type)
         if tests_to_run in ("all", "color"):
-            test_light_color(api, lid, listener, dmx_start, channel_map,
+            test_light_color(api, lid, args.device_ip, light_index,
                              results, args.settle_time)
         if tests_to_run in ("all", "brightness"):
-            test_light_brightness(api, lid, listener, dmx_start, channel_map,
+            test_light_brightness(api, lid, args.device_ip, light_index,
                                   results, args.settle_time,
                                   light_type=light_type)
         if tests_to_run in ("all", "accuracy"):
-            test_light_color_accuracy(api, lid, listener, dmx_start, channel_map,
-                                       results, args.settle_time,
-                                       device_ip=args.device_ip,
-                                       light_index=light_index)
+            test_light_color_accuracy(api, lid, args.device_ip, light_index,
+                                      results, args.settle_time)
         if tests_to_run in ("all", "colortemp"):
-            test_light_color_temperature(api, lid, listener, dmx_start, channel_map,
-                                          results, args.settle_time,
-                                          light_type=light_type)
+            test_light_color_temperature(api, lid, args.device_ip, light_index,
+                                         results, args.settle_time,
+                                         light_type=light_type)
         if tests_to_run in ("all", "rgbw"):
             if light_type == "RGBW":
-                test_rgbw_decomposition(api, lid, listener, dmx_start, channel_map,
-                                         results, args.settle_time,
-                                         device_ip=args.device_ip,
-                                         light_index=light_index)
-                test_rgbw_accuracy(api, lid, listener, dmx_start, channel_map,
-                                    results, args.settle_time,
-                                    device_ip=args.device_ip,
-                                    light_index=light_index)
+                test_rgbw_decomposition(api, lid, args.device_ip, light_index,
+                                        results, args.settle_time)
+                test_rgbw_accuracy(api, lid, args.device_ip, light_index,
+                                   results, args.settle_time)
             elif tests_to_run == "rgbw":
                 print(f"\n  SKIP: Light #{lid} is {light_type}, not RGBW")
 
@@ -2123,10 +1560,6 @@ def main():
         test_sse_keepalive(args.device_ip, results)
     elif tests_to_run == "sse" and not args.device_ip:
         print("\n  SKIP: SSE tests require --device-ip")
-
-    # --- Cleanup ---
-    if listener:
-        listener.stop()
 
     # --- Report ---
     all_passed = results.summary()

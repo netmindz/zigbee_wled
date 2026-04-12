@@ -49,9 +49,6 @@ python3 tools/integration_test.py --device-ip <IP> --test rgbw
 # Run only SSE tests (no Hue Bridge required)
 python3 tools/integration_test.py --device-ip <IP> --test sse
 
-# Skip ArtNet verification (Hue API only)
-python3 tools/integration_test.py --device-ip <IP> --skip-artnet
-
 # Hue Bridge debug/query tool
 python3 tools/hue_debug.py
 python3 tools/hue_debug.py --device-ip <IP>
