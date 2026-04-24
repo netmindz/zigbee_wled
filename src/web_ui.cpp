@@ -7,6 +7,7 @@
  * - REST API: GET/POST /api/config, POST /api/factory-reset
  * - WLED discovery API: GET /api/wled/discover
  * - Status API: GET /api/status
+ * - Usage reporting: GET /api/usage-info, POST /api/usage-consent
  * - SSE event stream: GET /api/events (replaces polling for live updates)
  *
  * Uses the ESP-IDF native HTTP server (esp_http_server) for async request
@@ -16,6 +17,7 @@
 
 #include "web_ui.h"
 #include "config_store.h"
+#include "usage_reporter.h"
 #include "wled_output.h"
 #include "wled_discovery.h"
 #include "zigbee_manager.h"
@@ -62,6 +64,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
                    background: #000; flex-shrink: 0; }
   .light-info { display: flex; flex-direction: column; gap: 4px; }
   .light-name { font-weight: bold; color: #e0e0e0; }
+  .light-name a { color: #e0e0e0; text-decoration: none; }
+  .light-name a:hover { color: #00d4ff; text-decoration: underline; }
   .light-detail { font-size: 0.85em; color: #888; }
   .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer;
          font-size: 0.9em; color: #fff; }
@@ -172,6 +176,25 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div id="otaStatus" style="font-size:0.85em;color:#aaa;margin-top:4px">Uploading...</div>
     </div>
   </form>
+</div>
+
+<!-- Usage Reporting Consent Modal -->
+<div class="modal" id="usageModal">
+  <div class="modal-content">
+    <div class="modal-title" id="usageModalTitle">Thank you for installing Zigbee WLED Bridge!</div>
+    <p style="color:#ccc;margin-bottom:12px" id="usageModalDesc"></p>
+    <p style="color:#ccc;margin-bottom:12px">Help make Zigbee WLED Bridge better by sharing anonymous hardware details like chip type and LED count. This helps us understand how the bridge is used — no personal data or network activity is ever collected.</p>
+    <div style="margin-bottom:16px">
+      <label style="display:flex;align-items:center;gap:8px;color:#ccc;cursor:pointer;margin-bottom:0">
+        <input type="checkbox" id="usageSaveChoice">
+        <span>Save my choice for future updates</span>
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" style="background:#444" onclick="usageRespond(false)">Skip</button>
+      <button class="btn btn-primary" onclick="usageRespond(true)">Report update</button>
+    </div>
+  </div>
 </div>
 
 <!-- Add/Edit Light Modal -->
@@ -301,7 +324,7 @@ function renderLights() {
     return `<div class="card light">
       <div class="light-preview" id="preview-${i}"></div>
       <div class="light-info">
-        <div class="light-name">${escHtml(l.name)} <span class="tag ${tagClass}">${l.type}</span></div>
+        <div class="light-name"><a href="http://${escAttr(l.wledHost || 'localhost')}:${l.wledPort || 80}" target="_blank" rel="noopener">${escHtml(l.name)}</a> <span class="tag ${tagClass}">${l.type}</span></div>
         <div class="light-detail">WLED: ${escHtml(l.wledHost || '(not set)')}:${l.wledPort || 80} | Endpoint ${10 + i}</div>
       </div>
       <div>
@@ -601,9 +624,81 @@ function startSSE() {
   };
 }
 
+// ---- Usage Reporting ----
+let usageInfo = null;
+
+async function checkUsageReport() {
+  if (isApMode) return; // no internet access in AP mode
+  try {
+    const r = await fetch('/api/usage-info');
+    usageInfo = await r.json();
+    if (usageInfo.alwaysReport) {
+      await sendUsageReport(usageInfo);
+      await saveUsageConsent(true, true);
+    } else if (usageInfo.shouldPrompt) {
+      showUsagePrompt(usageInfo);
+    }
+  } catch(e) {
+    console.log('Usage check failed:', e);
+  }
+}
+
+function showUsagePrompt(info) {
+  const isInstall = !info.previousVersion || info.previousVersion === '0.0.0';
+  document.getElementById('usageModalTitle').textContent = isInstall
+    ? 'Thank you for installing Zigbee WLED Bridge!'
+    : 'Zigbee WLED Bridge updated!';
+  document.getElementById('usageModalDesc').textContent = isInstall
+    ? 'You are running version ' + info.version + '.'
+    : 'Updated from ' + info.previousVersion + ' to ' + info.version + '.';
+  document.getElementById('usageModal').classList.add('active');
+}
+
+async function usageRespond(consent) {
+  document.getElementById('usageModal').classList.remove('active');
+  const remember = document.getElementById('usageSaveChoice').checked;
+  if (consent && usageInfo) {
+    try { await sendUsageReport(usageInfo); } catch(e) { console.log('Usage report failed:', e); }
+  }
+  await saveUsageConsent(consent, remember);
+}
+
+async function sendUsageReport(info) {
+  const payload = {
+    deviceId:         info.deviceId,
+    version:          info.version,
+    previousVersion:  info.previousVersion,
+    releaseName:      info.releaseName,
+    chip:             info.chip,
+    ledCount:         info.ledCount,
+    isMatrix:         info.isMatrix,
+    bootloaderSHA256: info.bootloaderSHA256,
+    brand:            info.brand,
+    flashSize:        info.flashSize,
+    repo:             info.repo,
+    integrations:     info.integrations
+  };
+  await fetch('https://usage.wled.me/api/usage/upgrade', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+}
+
+async function saveUsageConsent(consent, remember) {
+  try {
+    await fetch('/api/usage-consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ consent, remember })
+    });
+  } catch(e) { console.log('Failed to save consent:', e); }
+}
+
 // Initial load - fetch config and status, then start SSE
 Promise.all([loadStatus(), loadConfig()]).then(() => {
   document.getElementById('loadingState')?.remove();
+  checkUsageReport();
   if (useSSE) {
     startSSE();
   } else {
@@ -1286,6 +1381,29 @@ static esp_err_t handleNotFound(httpd_req_t *req) {
   return httpd_resp_send(req, "Not found", HTTPD_RESP_USE_STRLEN);
 }
 
+// GET /api/usage-info
+static esp_err_t handleUsageInfo(httpd_req_t *req) {
+  return sendJson(req, usageGetInfoJson());
+}
+
+// POST /api/usage-consent
+static esp_err_t handleUsageConsent(httpd_req_t *req) {
+  String body = readRequestBody(req);
+  if (body.length() == 0) {
+    return sendJsonError(req, 400, "No body");
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    return sendJsonError(req, 400, "Invalid JSON");
+  }
+
+  bool consent = doc["consent"] | false;
+  bool remember = doc["remember"] | false;
+  usageSaveConsent(consent, remember);
+  return sendJson(req, "{\"ok\":true}");
+}
+
 // ---- Setup API routes ----
 static void setupRoutes() {
   // GET /
@@ -1386,6 +1504,24 @@ static void setupRoutes() {
     .user_ctx  = nullptr
   };
   httpd_register_uri_handler(httpServer, &eventsUri);
+
+  // GET /api/usage-info
+  static const httpd_uri_t usageInfoUri = {
+    .uri       = "/api/usage-info",
+    .method    = HTTP_GET,
+    .handler   = handleUsageInfo,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &usageInfoUri);
+
+  // POST /api/usage-consent
+  static const httpd_uri_t usageConsentUri = {
+    .uri       = "/api/usage-consent",
+    .method    = HTTP_POST,
+    .handler   = handleUsageConsent,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &usageConsentUri);
 }
 
 // ---- Public functions ----
@@ -1433,7 +1569,7 @@ void webSetup() {
 
   // Configure and start the ESP-IDF HTTP server
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.max_uri_handlers = 14;
+  config.max_uri_handlers = 16;
   config.stack_size = 8192;
   config.uri_match_fn = httpd_uri_match_wildcard;
   config.lru_purge_enable = true;
