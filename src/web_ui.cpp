@@ -111,6 +111,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="status-item">
     <div class="label">WiFi</div>
     <div class="value" id="wifiStatus">...</div>
+    <div class="label" id="wifiRssi" style="display:none"></div>
   </div>
   <div class="status-item">
     <div class="label">Zigbee</div>
@@ -222,16 +223,31 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 let config = { lights: [] };
 let isApMode = false;
 
+function rssiLabel(rssi) {
+  if (rssi >= -60) return 'Excellent';
+  if (rssi >= -70) return 'Good';
+  if (rssi >= -80) return 'Fair';
+  return 'Weak';
+}
+
 async function loadStatus() {
   try {
     const r = await fetch('/api/status');
     const s = await r.json();
     document.getElementById('wifiStatus').textContent = s.wifi || 'Unknown';
+    const rssiEl = document.getElementById('wifiRssi');
+    if (s.rssi && s.wifi && s.wifi !== 'Not connected') {
+      rssiEl.textContent = s.rssi + ' dBm \u00b7 ' + rssiLabel(s.rssi);
+      rssiEl.style.display = '';
+    } else {
+      rssiEl.style.display = 'none';
+    }
     document.getElementById('zbStatus').textContent = s.zigbee || 'Unknown';
     isApMode = s.apMode || false;
     document.getElementById('wifiSetup').style.display = isApMode ? 'block' : 'none';
   } catch(e) {
     document.getElementById('wifiStatus').textContent = 'AP Mode';
+    document.getElementById('wifiRssi').style.display = 'none';
     document.getElementById('wifiSetup').style.display = 'block';
     isApMode = true;
   }
@@ -527,6 +543,13 @@ let useSSE = true;
 
 function applyStatus(s) {
   document.getElementById('wifiStatus').textContent = s.wifi || 'Unknown';
+  const rssiEl = document.getElementById('wifiRssi');
+  if (s.rssi && s.wifi && s.wifi !== 'Not connected') {
+    rssiEl.textContent = s.rssi + ' dBm \u00b7 ' + rssiLabel(s.rssi);
+    rssiEl.style.display = '';
+  } else {
+    rssiEl.style.display = 'none';
+  }
   document.getElementById('zbStatus').textContent = s.zigbee || 'Unknown';
   isApMode = s.apMode || false;
   document.getElementById('wifiSetup').style.display = isApMode ? 'block' : 'none';
@@ -669,6 +692,7 @@ static esp_err_t handleRoot(httpd_req_t *req) {
 static esp_err_t handleStatus(httpd_req_t *req) {
   JsonDocument doc;
   doc["wifi"] = WiFi.isConnected() ? WiFi.SSID() : "Not connected";
+  doc["rssi"] = WiFi.isConnected() ? static_cast<int>(WiFi.RSSI()) : 0;
   doc["apMode"] = apMode;
   doc["zigbee"] = !zigbeeIsEnabled() ? "Disabled - no lights configured"
                  : zigbeeIsPaired() ? "Paired"
@@ -1008,6 +1032,7 @@ struct StatusSnapshot {
   bool     zigbeeEnabled;
   bool     zigbeePaired;
   uint8_t  lightCount;
+  int8_t   rssi;
 };
 
 // Compact light state snapshot for change detection (avoids full JSON compare)
@@ -1031,6 +1056,7 @@ static unsigned long   sseLastKeepalive = 0;
 static String buildStatusJson() {
   JsonDocument doc;
   doc["wifi"] = WiFi.isConnected() ? WiFi.SSID() : "Not connected";
+  doc["rssi"] = WiFi.isConnected() ? static_cast<int>(WiFi.RSSI()) : 0;
   doc["apMode"] = apMode;
   doc["zigbee"] = !zigbeeIsEnabled() ? "Disabled - no lights configured"
                  : zigbeeIsPaired() ? "Paired"
@@ -1073,6 +1099,7 @@ static StatusSnapshot takeStatusSnapshot() {
   s.zigbeeEnabled = zigbeeIsEnabled();
   s.zigbeePaired  = zigbeeIsPaired();
   s.lightCount    = configStore.getLightCount();
+  s.rssi          = WiFi.isConnected() ? static_cast<int8_t>(WiFi.RSSI()) : 0;
   return s;
 }
 
@@ -1081,7 +1108,8 @@ static bool statusChanged(const StatusSnapshot& a, const StatusSnapshot& b) {
       || a.apMode != b.apMode
       || a.zigbeeEnabled != b.zigbeeEnabled
       || a.zigbeePaired != b.zigbeePaired
-      || a.lightCount != b.lightCount;
+      || a.lightCount != b.lightCount
+      || abs(static_cast<int>(a.rssi) - static_cast<int>(b.rssi)) >= 5;
 }
 
 static void takeLightSnapshot(LightSnapshot* out, uint8_t count) {
