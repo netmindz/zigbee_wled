@@ -16,6 +16,7 @@
 
 #include <Arduino.h>
 #include <ArduinoOTA.h>
+#include "log_buffer.h"
 #include "config_store.h"
 #include "wled_output.h"
 #include "web_ui.h"
@@ -29,6 +30,9 @@ static unsigned long lastWledUpdate = 0;
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Install log ring buffer first so boot messages are captured.
+  logBufferInit();
 
   ESP_LOGI("Main", "=== Zigbee WLED Bridge ===");
   ESP_LOGI("Main", "Firmware v0.1.0");

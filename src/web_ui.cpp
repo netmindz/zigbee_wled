@@ -16,6 +16,7 @@
  */
 
 #include "web_ui.h"
+#include "log_buffer.h"
 #include "config_store.h"
 #include "usage_reporter.h"
 #include "wled_output.h"
@@ -947,6 +948,33 @@ static esp_err_t handleRestart(httpd_req_t *req) {
   return ESP_OK;
 }
 
+// GET /api/logs — return recent log ring buffer as plain text
+static esp_err_t handleLogs(httpd_req_t *req) {
+  size_t sz = logBufferSize();
+  if (sz == 0) {
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, "(log buffer empty)", HTTPD_RESP_USE_STRLEN);
+  }
+  char *tmp = static_cast<char *>(malloc(sz + 1));
+  if (!tmp) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "OOM", HTTPD_RESP_USE_STRLEN);
+  }
+  size_t len = logBufferRead(tmp, sz + 1);
+  httpd_resp_set_type(req, "text/plain; charset=utf-8");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  esp_err_t err = httpd_resp_send(req, tmp, static_cast<ssize_t>(len));
+  free(tmp);
+  return err;
+}
+
+// POST /api/logs/clear — zero the ring buffer
+static esp_err_t handleLogsClear(httpd_req_t *req) {
+  logBufferClear();
+  return sendJson(req, "{\"ok\":true}");
+}
+
 // POST /api/ota — multipart firmware upload
 static esp_err_t handleOta(httpd_req_t *req) {
   int contentLen = req->content_len;
@@ -1487,6 +1515,24 @@ static void setupRoutes() {
   };
   httpd_register_uri_handler(httpServer, &restartUri);
 
+  // GET /api/logs — ring buffer of recent log output
+  static const httpd_uri_t logsUri = {
+    .uri       = "/api/logs",
+    .method    = HTTP_GET,
+    .handler   = handleLogs,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &logsUri);
+
+  // POST /api/logs/clear — zero the ring buffer
+  static const httpd_uri_t logsClearUri = {
+    .uri       = "/api/logs/clear",
+    .method    = HTTP_POST,
+    .handler   = handleLogsClear,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &logsClearUri);
+
   // POST /api/ota
   static const httpd_uri_t otaUri = {
     .uri       = "/api/ota",
@@ -1569,7 +1615,7 @@ void webSetup() {
 
   // Configure and start the ESP-IDF HTTP server
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.max_uri_handlers = 16;
+  config.max_uri_handlers = 20;
   config.stack_size = 8192;
   config.uri_match_fn = httpd_uri_match_wildcard;
   config.lru_purge_enable = true;
