@@ -106,6 +106,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #888;
              border-top-color: #00d4ff; border-radius: 50%; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  #logOutput { background: #0a0a1a; color: #b0ffb0; font-family: 'Courier New', monospace;
+               font-size: 0.78em; border: 1px solid #0f3460; border-radius: 4px; padding: 10px;
+               height: 280px; overflow-y: auto; white-space: pre; word-break: break-all;
+               margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -158,6 +162,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!-- Actions -->
 <div class="actions">
   <button class="btn btn-sm" style="background:#0f3460" onclick="restartDevice()">Restart Device</button>
+  <button class="btn btn-sm" style="background:#7c3aed" onclick="zigbeeReset()">Zigbee Reset</button>
   <button class="btn btn-danger btn-sm" onclick="factoryReset()">Factory Reset</button>
 </div>
 
@@ -177,6 +182,22 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div id="otaStatus" style="font-size:0.85em;color:#aaa;margin-top:4px">Uploading...</div>
     </div>
   </form>
+</div>
+
+<!-- Device Logs -->
+<div class="card" style="margin-top:12px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+    <h3 style="color:#00d4ff">Device Logs</h3>
+    <div style="display:flex;gap:8px;align-items:center">
+      <label style="display:flex;align-items:center;gap:4px;margin:0;font-size:0.85em;cursor:pointer">
+        <input type="checkbox" id="logAutoRefresh" onchange="toggleLogAutoRefresh()">
+        Auto
+      </label>
+      <button class="btn btn-sm" style="background:#0f3460" onclick="refreshLogs()">Refresh</button>
+      <button class="btn btn-danger btn-sm" onclick="clearLogs()">Clear</button>
+    </div>
+  </div>
+  <div id="logOutput">(click Refresh to load logs)</div>
 </div>
 
 <!-- Usage Reporting Consent Modal -->
@@ -498,6 +519,14 @@ async function factoryReset() {
   }
 }
 
+async function zigbeeReset() {
+  if (!confirm('Erase Zigbee storage and reboot? WiFi and light config are preserved, but the device will need to re-pair with the Hue bridge.')) return;
+  try {
+    await fetch('/api/zigbee-reset', { method: 'POST' });
+    document.getElementById('zbStatus').textContent = 'Resetting...';
+  } catch(e) { /* expected - device is restarting */ }
+}
+
 async function restartDevice() {
   if (!confirm('Restart the device?')) return;
   try {
@@ -694,6 +723,40 @@ async function saveUsageConsent(consent, remember) {
       body: JSON.stringify({ consent, remember })
     });
   } catch(e) { console.log('Failed to save consent:', e); }
+}
+
+// ---- Device Logs ----
+let logAutoTimer = null;
+
+async function refreshLogs() {
+  const el = document.getElementById('logOutput');
+  try {
+    const r = await fetch('/api/logs');
+    const text = await r.text();
+    el.textContent = text;
+    el.scrollTop = el.scrollHeight;
+  } catch(e) {
+    el.textContent = 'Failed to load logs: ' + e.message;
+  }
+}
+
+async function clearLogs() {
+  try {
+    await fetch('/api/logs/clear', { method: 'POST' });
+    document.getElementById('logOutput').textContent = '(log buffer cleared)';
+  } catch(e) {
+    alert('Failed to clear logs: ' + e.message);
+  }
+}
+
+function toggleLogAutoRefresh() {
+  if (document.getElementById('logAutoRefresh').checked) {
+    refreshLogs();
+    logAutoTimer = setInterval(refreshLogs, 3000);
+  } else {
+    clearInterval(logAutoTimer);
+    logAutoTimer = null;
+  }
 }
 
 // Initial load - fetch config and status, then start SSE
