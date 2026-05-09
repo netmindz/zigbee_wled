@@ -4,7 +4,7 @@
  * Provides:
  * - Captive portal AP for initial WiFi setup
  * - Configuration web UI for light definitions with WLED device discovery
- * - REST API: GET/POST /api/config, POST /api/factory-reset
+ * - REST API: GET/POST /api/config, POST /api/factory-reset, POST /api/zigbee-reset
  * - WLED discovery API: GET /api/wled/discover
  * - Status API: GET /api/status
  * - Usage reporting: GET /api/usage-info, POST /api/usage-consent
@@ -790,7 +790,8 @@ static esp_err_t handleStatus(httpd_req_t *req) {
   doc["wifi"] = WiFi.isConnected() ? WiFi.SSID() : "Not connected";
   doc["rssi"] = WiFi.isConnected() ? static_cast<int>(WiFi.RSSI()) : 0;
   doc["apMode"] = apMode;
-  doc["zigbee"] = !zigbeeIsEnabled() ? "Disabled - no lights configured"
+  doc["zigbee"] = !zigbeeIsEnabled() ? (apMode ? "Disabled - AP mode (no WiFi)"
+                                               : "Disabled - no lights configured")
                  : zigbeeIsPaired() ? "Paired"
                  : "Searching...";
   doc["eui64"] = zigbeeGetEUI64();
@@ -818,6 +819,7 @@ static esp_err_t handleLightState(httpd_req_t *req) {
     obj["w"] = static_cast<uint8_t>(st.white * briScale);
     obj["x"] = serialized(String(st.colorX, 4));
     obj["y"] = serialized(String(st.colorY, 4));
+    obj["effect"] = st.hueEffect[0] != '\0' ? st.hueEffect : "no_effect";
   }
   String json;
   serializeJson(doc, json);
@@ -919,6 +921,15 @@ static esp_err_t handleWifiPost(httpd_req_t *req) {
 
   // Restart after a short delay to let the response be sent
   delay(1000);
+  ESP.restart();
+  return ESP_OK;
+}
+
+// POST /api/zigbee-reset — erase Zigbee NVS only (WiFi + app config preserved)
+static esp_err_t handleZigbeeReset(httpd_req_t *req) {
+  zigbeeEraseStorage();
+  sendJson(req, "{\"ok\":true}");
+  delay(500);
   ESP.restart();
   return ESP_OK;
 }
@@ -1181,7 +1192,8 @@ static String buildStatusJson() {
   doc["wifi"] = WiFi.isConnected() ? WiFi.SSID() : "Not connected";
   doc["rssi"] = WiFi.isConnected() ? static_cast<int>(WiFi.RSSI()) : 0;
   doc["apMode"] = apMode;
-  doc["zigbee"] = !zigbeeIsEnabled() ? "Disabled - no lights configured"
+  doc["zigbee"] = !zigbeeIsEnabled() ? (apMode ? "Disabled - AP mode (no WiFi)"
+                                               : "Disabled - no lights configured")
                  : zigbeeIsPaired() ? "Paired"
                  : "Searching...";
   doc["eui64"] = zigbeeGetEUI64();
@@ -1208,6 +1220,7 @@ static String buildLightStateJson() {
     obj["w"] = static_cast<uint8_t>(st.white * briScale);
     obj["x"] = serialized(String(st.colorX, 4));
     obj["y"] = serialized(String(st.colorY, 4));
+    obj["effect"] = st.hueEffect[0] != '\0' ? st.hueEffect : "no_effect";
   }
   String json;
   serializeJson(doc, json);
@@ -1506,6 +1519,15 @@ static void setupRoutes() {
   };
   httpd_register_uri_handler(httpServer, &factoryResetUri);
 
+  // POST /api/zigbee-reset — erase Zigbee NVS, keep WiFi + app config
+  static const httpd_uri_t zigbeeResetUri = {
+    .uri       = "/api/zigbee-reset",
+    .method    = HTTP_POST,
+    .handler   = handleZigbeeReset,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &zigbeeResetUri);
+
   // POST /api/restart
   static const httpd_uri_t restartUri = {
     .uri       = "/api/restart",
@@ -1578,6 +1600,7 @@ void webSetup() {
   if (wifiSSID.length() > 0) {
     // Try to connect to stored WiFi
     ESP_LOGI("Web", "Connecting to WiFi: %s", wifiSSID.c_str());
+    WiFi.setHostname("zigbeewled");
     WiFi.mode(WIFI_AP_STA);
     WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
 
@@ -1597,12 +1620,14 @@ void webSetup() {
       WiFi.softAPdisconnect(true);
       webOnWifiConnected();
     } else {
-      ESP_LOGW("Web", "WiFi connection failed, staying in AP mode");
+      ESP_LOGW("Web", "WiFi connection failed, staying in AP mode — Zigbee disabled");
+      zigbeeSuppress();
       // Keep AP running for reconfiguration
     }
   } else {
     // No WiFi configured - start AP mode only
-    ESP_LOGI("Web", "No WiFi configured, starting AP mode");
+    ESP_LOGI("Web", "No WiFi configured, starting AP mode — Zigbee disabled");
+    zigbeeSuppress();
     WiFi.mode(WIFI_AP);
     WiFi.softAP("ZigbeeWLED-Setup", "");
     apMode = true;
@@ -1672,6 +1697,7 @@ void webLoop() {
     apMode = false;
     WiFi.softAPdisconnect(true);
     ESP_LOGI("Web", "WiFi connected: %s", WiFi.localIP().toString().c_str());
+    zigbeeUnsuppress();
     webOnWifiConnected();
   } else if (wasConnected && WiFi.status() != WL_CONNECTED) {
     wasConnected = false;

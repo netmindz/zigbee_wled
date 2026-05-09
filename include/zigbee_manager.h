@@ -20,8 +20,14 @@ void zigbeeSetup();
 // Start the Zigbee task (call after WiFi STA connects)
 void zigbeeStart();
 
-// Check if Zigbee is enabled (false when no lights configured)
+// Check if Zigbee is enabled (false when no lights configured or in AP mode)
 bool zigbeeIsEnabled();
+
+// Suppress Zigbee (e.g. when falling back to AP mode — AP and Zigbee are incompatible)
+void zigbeeSuppress();
+
+// Unsuppress Zigbee so zigbeeStart() can proceed (e.g. after WiFi reconnects)
+void zigbeeUnsuppress();
 
 // Check if Zigbee has joined a network
 bool zigbeeIsPaired();
@@ -37,3 +43,7 @@ void zigbeeReportState(uint8_t index, const LightState& state);
 
 // Re-register endpoints after config change (requires Zigbee restart)
 void zigbeeReconfigure();
+
+// Erase Zigbee NVS partition (zb_storage) without touching WiFi/app config.
+// Call before rebooting to force re-pairing with the coordinator.
+void zigbeeEraseStorage();

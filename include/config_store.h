@@ -28,6 +28,12 @@ struct LightConfig {
   uint16_t wledPort;        // HTTP port (default 80)
 };
 
+// Hue dynamic effect names as sent by the Hue bridge via manufacturer-specific Scenes commands.
+// "no_effect" (or empty string) means solid colour.
+// Known values: "candle", "fire", "sparkle", "prism", "opal", "glisten", "sunrise"
+#define HUE_EFFECT_NONE     "no_effect"
+#define HUE_EFFECT_MAX_LEN  32
+
 // Current state of a light (set by Zigbee, read by WLED output)
 struct LightState {
   bool     powerOn;
@@ -38,6 +44,7 @@ struct LightState {
   uint8_t  white;        // only used for RGBW
   float    colorX;       // CIE 1931 x (0.0-1.0), last received from ZCL
   float    colorY;       // CIE 1931 y (0.0-1.0), last received from ZCL
+  char     hueEffect[HUE_EFFECT_MAX_LEN]; // Hue dynamic effect name, "" = solid colour
 
   // Transition support: when a transition is active, we interpolate from
   // start values to current (target) values over the transition period.

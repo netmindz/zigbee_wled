@@ -22,6 +22,10 @@ Tests include:
   - COLORTEMP: verify mirek (color temperature) control
   - RGBW: verify white channel decomposition for RGBW-configured lights
     (W = min(R,G,B), then R'=R-W, G'=G-W, B'=B-W)
+  - EFFECTS: verify Hue dynamic effect names (candle, fire, sparkle, etc.)
+    are reflected in device state and that solid colour is restored on
+    "no_effect".  The Hue Bridge sends these as manufacturer-specific
+    Scenes cluster commands (manuf 0x100b).
   - SSE: verify Server-Sent Events stream (no Hue Bridge required)
 
 Prerequisites:
@@ -39,6 +43,9 @@ Usage:
 
   # Run only SSE tests (no Hue Bridge required):
   python3 tools/integration_test.py --device-ip 192.168.178.110 --test sse
+
+  # Run only effects tests:
+  python3 tools/integration_test.py --device-ip 192.168.178.110 --test effects
 
   # Run only RGBW tests:
   python3 tools/integration_test.py --device-ip 192.168.178.110 --test rgbw
@@ -180,6 +187,60 @@ def _device_request(method: str, url: str, retries: int = DEVICE_RETRIES,
             else:
                 print(f"  Failed after {retries} attempts for {url}: {e}")
     return None
+
+
+def wait_for_bridge(bridge_ip: str, api_key: str,
+                    timeout: float = 120.0, poll_interval: float = 3.0) -> bool:
+    """
+    Poll the Hue bridge until it responds to an API request.
+    Returns True when the bridge is reachable, False on timeout.
+    Useful after power-cycling the bridge before re-pairing.
+    """
+    url = f"https://{bridge_ip}/api/{api_key}/config"
+    deadline = time.time() + timeout
+    print(f"  Waiting for bridge at {bridge_ip} (timeout {int(timeout)}s)...",
+          flush=True)
+    while time.time() < deadline:
+        try:
+            r = requests.get(url, verify=False, timeout=5)
+            if r.status_code == 200:
+                print(f"  Bridge is up.")
+                return True
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+        print("  ...", end="", flush=True)
+    print()
+    print(f"  ERROR: Bridge did not come back within {int(timeout)}s")
+    return False
+
+
+def wait_for_device_paired(device_ip: str,
+                           timeout: float = 60.0, poll_interval: float = 3.0) -> bool:
+    """
+    Poll the device's /api/status until zigbee reports 'Paired'.
+    Returns True when paired, False on timeout.
+    """
+    deadline = time.time() + timeout
+    print(f"  Waiting for device at {device_ip} to pair (timeout {int(timeout)}s)...",
+          flush=True)
+    while time.time() < deadline:
+        try:
+            r = requests.get(f"http://{device_ip}/api/status", timeout=5)
+            if r.status_code == 200:
+                status = r.json()
+                zb = status.get("zigbee", "")
+                print(f"  ...zigbee={zb}", end="\r", flush=True)
+                if zb == "Paired":
+                    print()
+                    print(f"  Device paired.")
+                    return True
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+    print()
+    print(f"  ERROR: Device did not report Paired within {int(timeout)}s")
+    return False
 
 
 def get_device_config(device_ip: str) -> Optional[dict]:
@@ -1070,6 +1131,184 @@ def test_rgbw_accuracy(api: HueAPI, light_id: str, device_ip: str,
 
 
 # ---------------------------------------------------------------------------
+#  Hue API v2 helpers (CLIP v2 — needed for dynamic effect control)
+# ---------------------------------------------------------------------------
+#
+# The Hue v1 REST API (/api/{key}/lights/{id}/state) has no "effect" field for
+# dynamic effects; only the v2 CLIP API exposes them.  We use the v2 API solely
+# for sending dynamic effect commands; all other test setup still uses v1.
+
+class HueAPIv2:
+    """Minimal Hue Bridge CLIP v2 API client for dynamic effect control."""
+
+    def __init__(self, bridge_ip: str, api_key: str):
+        self.bridge_ip = bridge_ip
+        self.api_key = api_key
+        self.base_url = f"https://{bridge_ip}/clip/v2"
+
+    def _headers(self) -> dict:
+        return {"hue-application-key": self.api_key}
+
+    def get_lights(self) -> list:
+        """Return list of light resources from v2 API."""
+        r = requests.get(f"{self.base_url}/resource/light",
+                         headers=self._headers(), verify=False, timeout=10)
+        r.raise_for_status()
+        return r.json().get("data", [])
+
+    def get_light_by_v1_id(self, v1_light_id: str, v1_api: HueAPI) -> Optional[str]:
+        """
+        Resolve a v1 light ID to a v2 light resource ID.
+        Returns the v2 UUID string, or None if not found.
+        """
+        # Get v1 unique ID for this light
+        light = v1_api.get_light(v1_light_id)
+        v1_unique = light.get("uniqueid", "").lower().replace(":", "").replace("-", "")
+        if not v1_unique:
+            return None
+
+        for res in self.get_lights():
+            # v2 resources have an "id_v1" field like "/lights/12"
+            id_v1 = res.get("id_v1", "")
+            if id_v1 == f"/lights/{v1_light_id}":
+                return res.get("id")
+        return None
+
+    def set_effect(self, v2_light_id: str, effect: str) -> bool:
+        """
+        Set a dynamic effect on a light by its v2 resource ID.
+        effect: "no_effect", "candle", "fire", "sparkle", "prism", "opal",
+                "glisten", "sunrise"
+        Returns True on success.
+        """
+        url = f"{self.base_url}/resource/light/{v2_light_id}"
+        payload = {"effects": {"effect": effect}}
+        r = requests.put(url, headers=self._headers(), json=payload,
+                         verify=False, timeout=10)
+        if r.status_code not in (200, 207):
+            print(f"  WARNING: Hue v2 set_effect returned {r.status_code}: {r.text[:200]}")
+            return False
+        data = r.json()
+        errors = data.get("errors", [])
+        if errors:
+            print(f"  WARNING: Hue v2 API errors: {errors}")
+            return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+#  Effects test
+# ---------------------------------------------------------------------------
+
+# The Hue bridge sends dynamic effects as ZCL manufacturer-specific Scenes
+# commands (cluster 0x0005, manuf 0x100b).  The firmware intercepts these,
+# extracts the effect name string, and stores it in LightState.hueEffect,
+# which is then exposed via /api/lights/state as the "effect" field and sent
+# to WLED as the appropriate fx/palette combination.
+#
+# Because the exact payload format is not yet confirmed on hardware, these
+# tests verify the end-to-end pipeline at the device-state level.  If the
+# payload scanner in zigbee_manager.cpp cannot find a known effect name in
+# the raw bytes, it will log a warning and leave the field as "no_effect".
+# The tests will FAIL in that case, which is the intended signal to refine
+# the parser using the hex dump in the serial log.
+
+# Maps Hue effect name -> expected WLED FX ID (must match wled_output.cpp)
+HUE_EFFECT_TO_WLED_FX: dict = {
+    "candle":    91,
+    "fire":      45,
+    "sparkle":   68,
+    "prism":     10,
+    "opal":       2,
+    "glisten":   56,
+    "sunrise":   62,
+    "no_effect":  0,
+}
+
+
+def test_hue_effects(v1_api: HueAPI, v2_api: HueAPIv2,
+                     light_id: str, device_ip: str,
+                     light_index: int, results: TestResult,
+                     settle_time: float):
+    """
+    Test Hue dynamic effects (candle, fire, sparkle, prism, opal, glisten,
+    sunrise) sent via the Hue CLIP v2 API.
+
+    The bridge translates these into ZCL manufacturer-specific Scenes cluster
+    commands.  The firmware parses the payload and stores the effect name in
+    LightState.hueEffect, exposed via /api/lights/state as "effect".
+
+    NOTE: If the bridge does not support a particular effect for this light
+    (e.g. because it was paired as a Color Dimmable Light rather than Extended
+    Color Light), the test is skipped with a clear message.
+    """
+    print(f"\n--- Test: HUE EFFECTS for light #{light_id} ---")
+
+    # Resolve v1 light ID -> v2 resource ID
+    print(f"  Resolving v2 resource ID for light #{light_id}...")
+    v2_id = v2_api.get_light_by_v1_id(light_id, v1_api)
+    if not v2_id:
+        print(f"  SKIP: Could not resolve light #{light_id} to a v2 resource ID.")
+        print(f"  (Ensure the bridge has CLIP v2 enabled and the light is paired.)")
+        results.check(f"Light {light_id} effects: v2 resource ID resolved", True, False)
+        return
+    print(f"  v2 resource ID: {v2_id}")
+
+    # Ensure light is on at full brightness before effect tests
+    v1_api.set_light_state(light_id, {"on": True, "bri": 254, "xy": [0.3127, 0.3290]})
+    time.sleep(1.0)
+
+    # Effects to test, in order.  We skip effects the bridge rejects.
+    effects_to_test = ["candle", "fire", "sparkle", "prism", "opal", "glisten", "sunrise"]
+
+    for effect in effects_to_test:
+        print(f"  Setting effect: '{effect}'...")
+        ok = v2_api.set_effect(v2_id, effect)
+        if not ok:
+            print(f"    SKIP: Bridge rejected effect '{effect}' (not supported for this light)")
+            continue
+
+        time.sleep(settle_time)
+
+        # Query device state
+        dev_state = get_device_light_state(device_ip)
+        if not dev_state or light_index >= len(dev_state):
+            results.check(f"Light {light_id} effect '{effect}': device state readable",
+                          True, False)
+            continue
+
+        ls = dev_state[light_index]
+        reported_effect = ls.get("effect", "")
+        print(f"    Device reports effect='{reported_effect}' "
+              f"(on={ls.get('on')}, bri={ls.get('bri')})")
+
+        results.check(
+            f"Light {light_id} effect '{effect}': device reports correct effect name",
+            effect, reported_effect, tolerance=0)
+
+    # ---- Restore solid colour: set no_effect ----
+    print(f"  Clearing effect (setting 'no_effect')...")
+    ok = v2_api.set_effect(v2_id, "no_effect")
+    if ok:
+        time.sleep(settle_time)
+        dev_state = get_device_light_state(device_ip)
+        if dev_state and light_index < len(dev_state):
+            ls = dev_state[light_index]
+            reported_effect = ls.get("effect", "")
+            print(f"    Device reports effect='{reported_effect}'")
+            results.check(
+                f"Light {light_id} effect 'no_effect': device clears effect",
+                "no_effect", reported_effect, tolerance=0)
+
+    # ---- Verify light is still on after effects ----
+    dev_state = get_device_light_state(device_ip)
+    if dev_state and light_index < len(dev_state):
+        ls = dev_state[light_index]
+        results.check(f"Light {light_id} effects: light still on after effects",
+                      True, ls.get("on", False))
+
+
+# ---------------------------------------------------------------------------
 #  SSE (Server-Sent Events) test helpers and scenarios
 # ---------------------------------------------------------------------------
 
@@ -1476,7 +1715,8 @@ def main():
     parser.add_argument("--settle-time", type=float, default=DEFAULT_SETTLE_TIME,
                         help=f"Seconds to wait after Hue command (default: {DEFAULT_SETTLE_TIME})")
     parser.add_argument("--test", choices=["all", "onoff", "color", "brightness",
-                                           "accuracy", "colortemp", "rgbw", "sse"],
+                                           "accuracy", "colortemp", "rgbw",
+                                           "effects", "sse"],
                         default="all",
                         help="Which test to run (default: all)")
 
@@ -1511,6 +1751,7 @@ def main():
         print(f"API key: {api_key[:8]}...")
 
     api = HueAPI(bridge_ip, api_key) if bridge_ip and api_key else None
+    api_v2 = HueAPIv2(bridge_ip, api_key) if bridge_ip and api_key else None
 
     # --- Query device ---
     device_config = None
@@ -1610,6 +1851,12 @@ def main():
                                    results, args.settle_time)
             elif tests_to_run == "rgbw":
                 print(f"\n  SKIP: Light #{lid} is {light_type}, not RGBW")
+        if tests_to_run in ("all", "effects"):
+            if api_v2:
+                test_hue_effects(api, api_v2, lid, args.device_ip, light_index,
+                                 results, args.settle_time)
+            else:
+                print(f"\n  SKIP: Effects test requires Hue Bridge + API key")
 
         # Restore light to a neutral state
         print(f"\n  Restoring light #{lid} to white, ON, bri=254...")

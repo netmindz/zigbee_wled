@@ -51,6 +51,7 @@ private:
     uint8_t  green;
     uint8_t  blue;
     uint8_t  white;
+    char     hueEffect[HUE_EFFECT_MAX_LEN];
   };
   SentState lastSent[MAX_LIGHTS] = {};
 

@@ -61,15 +61,17 @@ The firmware uses custom partition layouts (`partitions/zigbee_dmx_4MB.csv` / `z
 ## First-Time Setup
 
 1. **Flash the firmware** to the ESP32-C6
-2. **Connect to the captive portal** — the device starts a WiFi AP named `ZigbeeWLED-Setup` (open, no password)
-3. **Configure WiFi** — enter your network SSID and password in the web UI. The device restarts and connects to your network.
-4. **Access the web UI** — browse to the device's IP address (check serial output or your router's DHCP table)
-5. **Add lights** — click "+ Add Light", use the "Scan" button to discover WLED devices on the network, select one, and save
-6. **Pair with Hue Bridge** — open the Hue app, go to Settings > Lights > Search. The device should appear as a new light.
+2. **Connect to the setup AP** — the device broadcasts a WiFi network named `ZigbeeWLED-Setup` (open, no password). Connect to it from your phone or computer; a captive portal page should open automatically (or browse to `http://192.168.4.1/`).
+3. **Enter your WiFi credentials** — type your home/office network SSID and password and save. The device will connect to your network (Zigbee remains disabled until WiFi is active).
+4. **Reconnect to your normal WiFi** — switch your phone or computer back to your regular network.
+5. **Open the web UI** — browse to [http://zigbeewled.local/](http://zigbeewled.local/). The IP address is also visible in serial output or your router's DHCP client list if mDNS is unavailable.
+6. **Add a light** — click "+ Add Light", use the "Scan" button to discover WLED devices on the network, select one, and save.
+7. **Restart** — click the Restart button in the web UI. The device will reboot with Zigbee enabled.
+8. **Pair with Hue Bridge** — open the Hue app, go to Settings > Lights > Search. The device should appear as a new light.
 
 ## Web UI
 
-The web interface is accessible at `http://<device-ip>/` and provides:
+The web interface is accessible at [http://zigbeewled.local/](http://zigbeewled.local/) (or `http://<device-ip>/`) and provides:
 
 - **Status bar** — WiFi connection, Zigbee pairing status, light count
 - **Light configuration** — add, edit, delete lights mapped to WLED devices

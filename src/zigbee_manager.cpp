@@ -28,6 +28,7 @@
 #include "esp_zigbee_core.h"
 #include "ha/esp_zigbee_ha_standard.h"
 #include "aps/esp_zigbee_aps.h"
+#include "nwk/esp_zigbee_nwk.h"
 #include "esp_coexist.h"
 #include "esp_ieee802154.h"
 #include "esp_coex_i154.h"
@@ -50,6 +51,7 @@ extern "C" {
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include <string.h>
 
 #ifndef ZIGBEE_ENDPOINT_BASE
   #define ZIGBEE_ENDPOINT_BASE 10
@@ -537,9 +539,175 @@ extern "C" void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
   }
 }
 
+// ---- Hue 0xFC03 custom cluster command handler ----
+// Called from zb_action_handler when ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID fires.
+// Decodes Philips Hue "multiColor" frames (command 0x00) on cluster 0xFC03,
+// manufacturer code 0x100B.
+//
+// Wire field order (only fields present when flag bit is set):
+//   flags[2LE]  ON_OFF[1]  BRIGHTNESS[1]  COLOR_MIREK[2LE]  COLOR_XY[4]
+//   FADE_SPEED[2LE]  EFFECT_TYPE[1]  GRADIENT_COLORS[1+3n]
+//   EFFECT_SPEED[1]  GRADIENT_PARAMS[variable]
+//
+// Flag bits: ON_OFF=0x0001 BRIGHTNESS=0x0002 COLOR_MIREK=0x0004 COLOR_XY=0x0008
+//            FADE_SPEED=0x0010 EFFECT_TYPE=0x0020 GRADIENT_PARAMS=0x0040
+//            EFFECT_SPEED=0x0080 GRADIENT_COLORS=0x0100
+static esp_err_t zb_handle_hue_custom_cluster(const void *message) {
+  auto *msg = static_cast<const esp_zb_zcl_custom_cluster_command_message_t *>(message);
+  if (!msg) return ESP_ERR_INVALID_ARG;
+
+  uint8_t endpoint = msg->info.dst_endpoint;
+
+  // Always log custom cluster commands so we can map unknown clusters/commands
+  {
+    const uint8_t *p0 = static_cast<const uint8_t *>(msg->data.value);
+    char hexBuf[msg->data.size * 3 + 1];
+    for (uint16_t i = 0; i < msg->data.size; i++) snprintf(&hexBuf[i*3], 4, "%02X ", p0[i]);
+    hexBuf[msg->data.size * 3] = '\0';
+    ESP_LOGI("ZB", "Custom cluster: cl=0x%04X cmd=0x%02X manuf=0x%04X ep=%d (%u B): %s",
+             msg->info.cluster, msg->info.command.id, msg->info.header.manuf_code,
+             endpoint, msg->data.size, hexBuf);
+  }
+
+  // Filter: must be cluster 0xFC01 or 0xFC03 (Hue effect clusters, old/new bridge),
+  // command 0x00 ("multiColor"), Philips manuf code 0x100B
+  if ((msg->info.cluster != 0xFC01 && msg->info.cluster != 0xFC03) ||
+      msg->info.command.id != 0x00 ||
+      msg->info.header.manuf_code != 0x100B) {
+    return ESP_OK;
+  }
+
+  int idx = endpointToIndex(endpoint);
+  if (idx < 0) return ESP_OK;
+
+  const uint8_t *p = static_cast<const uint8_t *>(msg->data.value);
+  uint16_t remaining = msg->data.size;
+
+  if (remaining < 2) return ESP_OK;
+  uint16_t flags = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+  p += 2; remaining -= 2;
+
+  // Helper lambdas for safe byte consumption
+  auto consume1 = [&](uint8_t &out) -> bool {
+    if (remaining < 1) return false;
+    out = *p++; remaining--;
+    return true;
+  };
+  auto consume2le = [&](uint16_t &out) -> bool {
+    if (remaining < 2) return false;
+    out = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+    p += 2; remaining -= 2;
+    return true;
+  };
+  auto skip = [&](uint16_t n) {
+    if (n > remaining) n = remaining;
+    p += n; remaining -= n;
+  };
+
+  // Parsed fields (applied to state after mutex acquired)
+  bool     hasPower = false,      newPower = false;
+  bool     hasBri = false;        uint8_t  newBri = 0;
+  bool     hasMirek = false;      uint16_t newMirek = 0;
+  bool     hasXY = false;         uint16_t newX = 0, newY = 0;
+  bool     hasEffect = false;     uint8_t  effectByte = 0;
+
+  // ON_OFF (0x0001) — 1 byte: 0x00=off, 0x01=on
+  if (flags & 0x0001) {
+    uint8_t v;
+    if (consume1(v)) { hasPower = true; newPower = (v != 0); }
+  }
+  // BRIGHTNESS (0x0002) — 1 byte: Zigbee 0-254 scale
+  if (flags & 0x0002) {
+    uint8_t v;
+    if (consume1(v)) { hasBri = true; newBri = v; }
+  }
+  // COLOR_MIREK (0x0004) — 2 bytes LE: colour temperature in mirek
+  if (flags & 0x0004) {
+    uint16_t v;
+    if (consume2le(v)) { hasMirek = true; newMirek = v; }
+  }
+  // COLOR_XY (0x0008) — 4 bytes: 2× LE uint16 (X, Y, ZCL scale 0-65279)
+  if (flags & 0x0008) {
+    uint16_t x, y;
+    if (consume2le(x) && consume2le(y)) { hasXY = true; newX = x; newY = y; }
+  }
+  // FADE_SPEED (0x0010) — 2 bytes LE: ignored for now
+  if (flags & 0x0010) { skip(2); }
+  // EFFECT_TYPE (0x0020) — 1 byte: effect identifier
+  if (flags & 0x0020) {
+    uint8_t v;
+    if (consume1(v)) { hasEffect = true; effectByte = v; }
+  }
+  // GRADIENT_COLORS (0x0100) — 1 byte count + count*3 bytes: skip
+  if (flags & 0x0100) {
+    uint8_t cnt;
+    if (consume1(cnt)) { skip(static_cast<uint16_t>(cnt) * 3); }
+  }
+  // EFFECT_SPEED (0x0080) — 1 byte: ignored for now
+  if (flags & 0x0080) { skip(1); }
+  // GRADIENT_PARAMS (0x0040) — variable, consume remainder
+  if (flags & 0x0040) { skip(remaining); }
+
+  // Effect byte → name string
+  static const struct { uint8_t id; const char *name; } kEffectMap[] = {
+    { 0x00, "no_effect" }, { 0x01, "candle"  }, { 0x02, "fire"    },
+    { 0x03, "prism"     }, { 0x09, "sunrise" }, { 0x0A, "sparkle" },
+    { 0x0B, "opal"      }, { 0x0C, "glisten" }, { 0x0D, "sunset"  },
+    { 0x0E, "underwater"}, { 0x0F, "cosmos"  }, { 0x10, "sunbeam" },
+    { 0x11, "enchant"   },
+  };
+  const char *effectName = nullptr;
+  if (hasEffect) {
+    for (auto &e : kEffectMap) {
+      if (e.id == effectByte) { effectName = e.name; break; }
+    }
+    if (!effectName) {
+      ESP_LOGW("ZB", "Unknown Hue effect byte 0x%02x on ep %d — treating as no_effect",
+               effectByte, endpoint);
+      effectName = "no_effect";
+    }
+    ESP_LOGI("ZB", "Hue effect on ep %d: \"%s\" (0x%02x)", endpoint, effectName, effectByte);
+  }
+
+  // Apply to light state
+  if (zbStateMutex && xSemaphoreTake(zbStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (hasPower)  lightStates[idx].powerOn    = newPower;
+    if (hasBri)    lightStates[idx].brightness = newBri;
+    if (hasMirek) {
+      uint8_t r, g, b, w;
+      mirekToRGB(newMirek, r, g, b);
+      decomposeRGBW(idx, r, g, b, w);
+      lightStates[idx].red = r; lightStates[idx].green = g;
+      lightStates[idx].blue = b; lightStates[idx].white = w;
+      uint16_t zclX, zclY;
+      rgbToXY(r, g, b, zclX, zclY);
+      lightStates[idx].colorX = static_cast<float>(zclX) / 65279.0f;
+      lightStates[idx].colorY = static_cast<float>(zclY) / 65279.0f;
+    }
+    if (hasXY) {
+      uint8_t r, g, b, w;
+      xyToRGB(newX, newY, r, g, b);
+      decomposeRGBW(idx, r, g, b, w);
+      lightStates[idx].red = r; lightStates[idx].green = g;
+      lightStates[idx].blue = b; lightStates[idx].white = w;
+      lightStates[idx].colorX = static_cast<float>(newX) / 65279.0f;
+      lightStates[idx].colorY = static_cast<float>(newY) / 65279.0f;
+    }
+    if (hasEffect) {
+      strlcpy(lightStates[idx].hueEffect, effectName, HUE_EFFECT_MAX_LEN);
+    }
+    xSemaphoreGive(zbStateMutex);
+  }
+  return ESP_OK;
+}
+
 // ---- Attribute set callback ----
 static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                                     const void *message) {
+  ESP_LOGI("ZB", "Action callback: 0x%04x", (unsigned)callback_id);
+  if (callback_id == ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID) {
+    return zb_handle_hue_custom_cluster(message);
+  }
   if (callback_id != ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID) return ESP_OK;
 
   auto *msg = static_cast<const esp_zb_zcl_set_attr_value_message_t *>(message);
@@ -609,12 +777,75 @@ bool zb_raw_command_handler(uint8_t bufid) {
   zb_zcl_parsed_hdr_t *cmd_info = ZB_BUF_GET_PARAM(bufid, zb_zcl_parsed_hdr_t);
   uint8_t endpoint = cmd_info->addr_data.common_data.dst_endpoint;
 
-  // Issue #681: Hue manufacturer-specific scene commands crash ZBOSS
+  // ---- Hue manufacturer-specific scene commands (cluster 0x0005, manuf 0x100b) ----
+  // These carry Hue dynamic effect names (candle, fire, sparkle, prism, opal,
+  // glisten, sunrise, no_effect).  Passing them to ZBOSS crashes the stack
+  // (issue #681), so we must intercept them here.
+  //
+  // Assumed payload format (matches Hue REST API v2 "effects.status" names):
+  // a null-terminated ASCII string, possibly prefixed by a 1-byte command ID
+  // or group/scene fields from the ZCL Scenes frame.  We log the raw bytes so
+  // the format can be verified on hardware and the parser refined if needed.
   if (cmd_info->cluster_id == ESP_ZB_ZCL_CLUSTER_ID_SCENES &&
       cmd_info->is_manuf_specific &&
       cmd_info->manuf_specific == 0x100b) {
-    ESP_LOGD("ZB", "Intercepted Hue scene cmd 0x%02x on ep %d", cmd_info->cmd_id, endpoint);
-    zb_zcl_send_default_handler(bufid, cmd_info, ZB_ZCL_STATUS_FAIL);
+
+    uint8_t *payload     = (uint8_t *)zb_buf_begin(bufid);
+    zb_uint_t payloadLen = zb_buf_len(bufid);
+
+    // Log raw bytes so we can verify/extend the mapping
+    if (payloadLen > 0) {
+      char hexBuf[payloadLen * 3 + 1];
+      for (zb_uint_t i = 0; i < payloadLen; i++) {
+        snprintf(&hexBuf[i * 3], 4, "%02X ", payload[i]);
+      }
+      hexBuf[payloadLen * 3] = '\0';
+      ESP_LOGI("ZB", "Hue scene cmd 0x%02x ep %d payload (%u B): %s",
+               cmd_info->cmd_id, endpoint, (unsigned)payloadLen, hexBuf);
+    } else {
+      ESP_LOGI("ZB", "Hue scene cmd 0x%02x ep %d (empty payload)", cmd_info->cmd_id, endpoint);
+    }
+
+    // ---- Effect byte mapping ----
+    // Payload byte 2 identifies the Hue dynamic effect.
+    // Values captured on hardware by recalling native Hue effect scenes:
+    //   0x5F = candle   0x8B = fire   0x5B = sparkle   0x9E = prism
+    //   0x?? = opal     0x?? = glisten   0x?? = sunrise
+    //   0x00 = no_effect (assumed — clears active effect)
+    // Bytes 0-1 are identical across all effects (likely flags/group-id).
+    // Bytes 3+ are per-effect color data and are ignored here.
+    // Note: opal/glisten/sunrise bytes are unknown because no native Hue scenes
+    // exist for those effects on this bridge.  Add cases here once captured.
+    if (payloadLen >= 3) {
+      uint8_t effectByte = payload[2];
+      const char *effectName = nullptr;
+      switch (effectByte) {
+        case 0x00: effectName = "no_effect"; break;
+        case 0x5B: effectName = "sparkle";   break;
+        case 0x5F: effectName = "candle";    break;
+        case 0x8B: effectName = "fire";      break;
+        case 0x9E: effectName = "prism";     break;
+        // TODO: opal, glisten, sunrise — byte values not yet captured
+        default:
+          ESP_LOGW("ZB", "Hue scene: unknown effect byte 0x%02X on ep %d", effectByte, endpoint);
+          break;
+      }
+
+      int idx = endpointToIndex(endpoint);
+      if (idx >= 0 && zbStateMutex &&
+          xSemaphoreTake(zbStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (effectName) {
+          strlcpy(lightStates[idx].hueEffect, effectName, HUE_EFFECT_MAX_LEN);
+          ESP_LOGI("ZB", "Hue effect: \"%s\" (0x%02X) on ep %d", effectName, effectByte, endpoint);
+        } else {
+          // Unknown byte — clear effect so WLED reverts to solid
+          lightStates[idx].hueEffect[0] = '\0';
+        }
+        xSemaphoreGive(zbStateMutex);
+      }
+    }
+
+    zb_zcl_send_default_handler(bufid, cmd_info, ZB_ZCL_STATUS_SUCCESS);
     return true;
   }
 
@@ -808,19 +1039,60 @@ static void createLightEndpoint(esp_zb_ep_list_t *ep_list, uint8_t endpoint, con
 
   esp_zb_cluster_list_t *cluster_list = esp_zb_color_dimmable_light_clusters_create(&light_cfg);
 
-  // Add color temperature attributes (required for CT support)
+  // Add color temperature and primary colour attributes (required for CT support
+  // and for the Hue bridge to classify us as Gamut C — without primary XY attrs
+  // the bridge reports colorgamuttype="other" and refuses to send dynamic effects).
+  //
+  // Hue Gamut C vertices (CIE 1931 xy, ZCL scale: 0-65279):
+  //   Primary 1 (Red):   x=0.6915  y=0.3083
+  //   Primary 2 (Green): x=0.1700  y=0.7000
+  //   Primary 3 (Blue):  x=0.1532  y=0.0475
   esp_zb_attribute_list_t *color_cluster = esp_zb_cluster_list_get_cluster(
     cluster_list, ESP_ZB_ZCL_CLUSTER_ID_COLOR_CONTROL, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
   if (color_cluster) {
+    // Color temperature
     uint16_t ct_default = 0x00fa;  // 250 mirek (4000K)
-    uint16_t ct_min = 153;   // 6536K (cool daylight)
-    uint16_t ct_max = 500;   // 2000K (warm candle)
+    uint16_t ct_min = 153;         // 6536K (cool daylight)
+    uint16_t ct_max = 500;         // 2000K (warm candle)
     esp_zb_color_control_cluster_add_attr(color_cluster,
       ESP_ZB_ZCL_ATTR_COLOR_CONTROL_COLOR_TEMPERATURE_ID, &ct_default);
     esp_zb_color_control_cluster_add_attr(color_cluster,
       ESP_ZB_ZCL_ATTR_COLOR_CONTROL_COLOR_TEMP_PHYSICAL_MIN_MIREDS_ID, &ct_min);
     esp_zb_color_control_cluster_add_attr(color_cluster,
       ESP_ZB_ZCL_ATTR_COLOR_CONTROL_COLOR_TEMP_PHYSICAL_MAX_MIREDS_ID, &ct_max);
+
+    // Primary colours — Hue Gamut C (ZCL uint16, scale: value/65279 = CIE xy)
+    // Use esp_zb_cluster_add_attr() (not the cluster-specific helper) because
+    // the ESP-IDF color control cluster only pre-registers a subset of optional
+    // attributes and rejects Primary 1-3 X/Y/Intensity via the typed helper.
+    uint16_t p1x = static_cast<uint16_t>(0.6915f * 65279.0f + 0.5f);  // 45130
+    uint16_t p1y = static_cast<uint16_t>(0.3083f * 65279.0f + 0.5f);  // 20126
+    uint16_t p2x = static_cast<uint16_t>(0.1700f * 65279.0f + 0.5f);  // 11097
+    uint16_t p2y = static_cast<uint16_t>(0.7000f * 65279.0f + 0.5f);  // 45695
+    uint16_t p3x = static_cast<uint16_t>(0.1532f * 65279.0f + 0.5f);  // 10000
+    uint16_t p3y = static_cast<uint16_t>(0.0475f * 65279.0f + 0.5f);  //  3101
+    uint8_t  p_intensity = 0xFE;  // max intensity (0xFF = not used)
+
+    // attr_type 0x21 = ZCL uint16; attr_type 0x20 = ZCL uint8
+    // attr_access 0x01 = read-only
+    struct { uint16_t id; uint8_t type; void *val; } primary_attrs[] = {
+      { ZB_ZCL_ATTR_COLOR_CONTROL_PRIMARY_1_X_ID,         0x21, &p1x },
+      { ZB_ZCL_ATTR_COLOR_CONTROL_PRIMARY_1_Y_ID,         0x21, &p1y },
+      { ZB_ZCL_ATTR_COLOR_CONTROL_PRIMARY_1_INTENSITY_ID, 0x20, &p_intensity },
+      { ZB_ZCL_ATTR_COLOR_CONTROL_PRIMARY_2_X_ID,         0x21, &p2x },
+      { ZB_ZCL_ATTR_COLOR_CONTROL_PRIMARY_2_Y_ID,         0x21, &p2y },
+      { ZB_ZCL_ATTR_COLOR_CONTROL_PRIMARY_2_INTENSITY_ID, 0x20, &p_intensity },
+      { ZB_ZCL_ATTR_COLOR_CONTROL_PRIMARY_3_X_ID,         0x21, &p3x },
+      { ZB_ZCL_ATTR_COLOR_CONTROL_PRIMARY_3_Y_ID,         0x21, &p3y },
+      { ZB_ZCL_ATTR_COLOR_CONTROL_PRIMARY_3_INTENSITY_ID, 0x20, &p_intensity },
+    };
+    for (auto &a : primary_attrs) {
+      esp_err_t err = esp_zb_cluster_add_attr(color_cluster,
+        ESP_ZB_ZCL_CLUSTER_ID_COLOR_CONTROL, a.id, a.type, 0x01, a.val);
+      if (err != ESP_OK) {
+        ESP_LOGW("ZB", "Failed to add primary colour attr 0x%04x: 0x%x", a.id, err);
+      }
+    }
   }
 
   // Add extra on_off attributes required by Hue
@@ -840,15 +1112,12 @@ static void createLightEndpoint(esp_zb_ep_list_t *ep_list, uint8_t endpoint, con
     cluster_list, ESP_ZB_ZCL_CLUSTER_ID_BASIC, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
   if (basic_cluster) {
     // ZCL string format: first byte = length
-    char manuf[] = "\x0B" "ZigbeeWLED";
-
-    // Build model identifier from name
-    char model[34];
-    uint8_t nameLen = strlen(name);
-    if (nameLen > 32) nameLen = 32;
-    model[0] = nameLen;
-    memcpy(&model[1], name, nameLen);
-    model[nameLen + 1] = '\0';
+    // Spoof Signify manufacturer + LCT015 model so the Hue bridge recognises us
+    // as a Gamut C device and enables dynamic effects (candle, fire, etc.).
+    // The bridge uses an internal model-ID database rather than reading ZCL
+    // Primary XY attributes, so this is the only reliable way to get Gamut C.
+    char manuf[] = "\x18" "Signify Netherlands B.V.";
+    char model[] = "\x06" "LCT015";
 
     char sw[] = "\x05" "0.1.0";
     uint8_t app_ver = 1, stack_ver = 1, hw_ver = 1;
@@ -860,6 +1129,18 @@ static void createLightEndpoint(esp_zb_ep_list_t *ep_list, uint8_t endpoint, con
     esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_STACK_VERSION_ID, &stack_ver);
     esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_HW_VERSION_ID, &hw_ver);
   }
+
+  // Hue manufacturer-specific clusters for dynamic effects:
+  //   0xFC01 — used by older Hue bridge firmware (observed on hardware)
+  //   0xFC03 — used by newer Hue bridge firmware (per zigbee-herdsman docs)
+  // Register both as server role so the bridge can dispatch to either.
+  // No attributes needed — effect data arrives in the command payload.
+  esp_zb_attribute_list_t *hue_cluster_fc01 = esp_zb_zcl_attr_list_create(0xFC01);
+  esp_zb_cluster_list_add_custom_cluster(cluster_list, hue_cluster_fc01,
+    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+  esp_zb_attribute_list_t *hue_cluster_fc03 = esp_zb_zcl_attr_list_create(0xFC03);
+  esp_zb_cluster_list_add_custom_cluster(cluster_list, hue_cluster_fc03,
+    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
   // Create endpoint with app_device_version = 1 (required by Hue)
   esp_zb_endpoint_config_t endpoint_config = {
@@ -885,6 +1166,10 @@ static void zigbeeTask(void *pvParameters) {
   zb_nwk_cfg.nwk_cfg.zed_cfg.ed_timeout = ESP_ZB_ED_AGING_TIMEOUT_64MIN;
   zb_nwk_cfg.nwk_cfg.zed_cfg.keep_alive = 3000;
   esp_zb_init(&zb_nwk_cfg);
+
+  // Set Signify's Zigbee Alliance manufacturer code so the Hue bridge marks
+  // us as a certified device and assigns Gamut C / effects capability.
+  esp_zb_set_node_descriptor_manufacturer_code(0x100B);
 
   // Critical: distributed security for Hue bridge
   esp_zb_enable_joining_to_distributed(true);
@@ -1033,6 +1318,19 @@ bool zigbeeIsEnabled() {
   return !zbSuppressed;
 }
 
+void zigbeeSuppress() {
+  zbSuppressed = true;
+  ESP_LOGW("ZB", "Zigbee suppressed (AP mode active)");
+}
+
+void zigbeeUnsuppress() {
+  // Only unsuppress if there are lights configured (original suppression reason may have been no-lights)
+  if (configStore.getLightCount() > 0) {
+    zbSuppressed = false;
+    ESP_LOGI("ZB", "Zigbee unsuppressed");
+  }
+}
+
 bool zigbeeIsPaired() {
   return zbPaired;
 }
@@ -1068,6 +1366,27 @@ void zigbeeReconfigure() {
   ESP_LOGW("ZB", "Light config changed. Restart required for Zigbee to pick up changes.");
 }
 
+void zigbeeEraseStorage() {
+  // Erase zb_storage and zb_fct partitions so the Zigbee stack treats the
+  // next boot as factory-new and enters network steering (pairing) mode.
+  // WiFi credentials and app config (NVS) are left untouched.
+  const char *partitions[] = { "zb_storage", "zb_fct" };
+  for (const char *name : partitions) {
+    const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                                            ESP_PARTITION_SUBTYPE_ANY, name);
+    if (part) {
+      esp_err_t err = esp_partition_erase_range(part, 0, part->size);
+      if (err == ESP_OK) {
+        ESP_LOGI("ZB", "Erased partition: %s", name);
+      } else {
+        ESP_LOGE("ZB", "Failed to erase partition %s: 0x%x", name, err);
+      }
+    } else {
+      ESP_LOGW("ZB", "Partition not found: %s", name);
+    }
+  }
+}
+
 #else
 // Stub implementations for non-C6 targets (won't compile Zigbee code)
 
@@ -1078,6 +1397,8 @@ void zigbeeSetup() {
 }
 void zigbeeStart() {}
 bool zigbeeIsEnabled() { return false; }
+void zigbeeSuppress() {}
+void zigbeeUnsuppress() {}
 bool zigbeeIsPaired() { return false; }
 const char* zigbeeGetEUI64() { return "N/A"; }
 const LightState& zigbeeGetLightState(uint8_t index) {
@@ -1086,5 +1407,6 @@ const LightState& zigbeeGetLightState(uint8_t index) {
 }
 void zigbeeReportState(uint8_t index, const LightState& state) {}
 void zigbeeReconfigure() {}
+void zigbeeEraseStorage() {}
 
 #endif // CONFIG_IDF_TARGET_ESP32C6

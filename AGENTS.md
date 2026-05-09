@@ -149,6 +149,27 @@ Each module has a matching `include/<name>.h` / `src/<name>.cpp` pair.
 - Shebang: `#!/usr/bin/env python3`
 - Handle missing `requests` import with a friendly error message and `sys.exit(1)`
 
+## Hue Bridge Re-Pairing Procedure
+
+When forcing the ESP32 to re-pair with the Hue bridge (e.g. after a Zigbee
+storage erase):
+
+1. Delete the device's lights from the Hue app.
+2. **Power cycle the Hue bridge** (unplug, wait 10s, replug). Without this the
+   bridge often remembers the device internally and will not rediscover it as a
+   new light even after deletion.
+3. Poll the bridge until it responds before proceeding — do NOT use a fixed
+   sleep. Use `wait_for_bridge()` from `tools/integration_test.py`, or simply
+   retry `GET https://<bridge>/api/<key>/config` until HTTP 200.
+4. POST to `/api/zigbee-reset` on the ESP32 — this erases only `zb_storage`
+   and `zb_fct` (WiFi and app config are preserved) then reboots.
+5. Trigger a Zigbee search on the bridge:
+   `python3 tools/hue_debug.py --search`
+6. The ESP32 should appear as a new light within ~30s.
+
+Note: `/api/zigbee-reset` preserves WiFi credentials. Use `/api/factory-reset`
+only when you also want to wipe WiFi and app config.
+
 ## Architecture Notes
 
 - Zigbee ZBOSS stack runs in its own FreeRTOS task (16KB stack, priority 5)

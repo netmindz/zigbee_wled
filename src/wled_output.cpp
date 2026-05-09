@@ -18,6 +18,35 @@ WledOutput wledOutput;
 // HTTP timeout in ms — needs to be generous due to WiFi/Zigbee coexistence
 static const int HTTP_TIMEOUT_MS = 20000;
 
+// ---- Hue dynamic effect → WLED FX mapping ----
+// Mirrors the mapping in the PhilipsHueV2 usermod (REST API side) so that
+// both integration paths produce consistent WLED effects.
+// outPalette is set to the recommended WLED palette index (0 = default).
+// Returns WLED FX ID; 0 = Solid (no effect).
+//
+// NOTE: Use FX_MODE_CANDLE_MULTI (91) not FX_MODE_CANDLE (88) — the single-LED
+// candle effect has a WLED bug where it dereferences uninitialised data on first
+// call after a mode change.
+//
+// Hue effect names are assumed to match the REST API v2 "effects.status" values:
+//   no_effect, candle, fire, sparkle, prism, opal, glisten, sunrise
+// These are sent over Zigbee as manufacturer-specific Scenes cluster commands
+// (Philips manuf code 0x100b).  The payload format is verified at runtime via
+// the ESP_LOGD hex dumps in zigbee_manager.cpp.
+static uint8_t hueEffectToWledFx(const char* effect, uint8_t& outPalette) {
+  outPalette = 0;
+  if (!effect || effect[0] == '\0' || strcmp(effect, HUE_EFFECT_NONE) == 0) return 0;
+  if (strcmp(effect, "candle")  == 0) { outPalette = 2; return 91; }  // Candle Multi, Color Gradient palette
+  if (strcmp(effect, "fire")    == 0) { outPalette = 4; return 45; }  // Fire 2012, Color Gradient palette
+  if (strcmp(effect, "sparkle") == 0) { outPalette = 4; return 68; }  // Sparkle, Color Gradient palette
+  if (strcmp(effect, "prism")   == 0) { return 10; }                  // Rainbow Cycle (uses its own colours)
+  if (strcmp(effect, "opal")    == 0) { outPalette = 2; return 2;  }  // Breath, Color Gradient palette
+  if (strcmp(effect, "glisten") == 0) { outPalette = 2; return 56; }  // Twinkle Fox, Color Gradient palette
+  if (strcmp(effect, "sunrise") == 0) { return 62; }                  // Sunrise (uses its own colours)
+  ESP_LOGW("WLED", "Unknown Hue effect: \"%s\", falling back to Solid", effect);
+  return 0;
+}
+
 // Consecutive error tracking per device
 static uint32_t sendErrors[MAX_LIGHTS] = {};
 
@@ -44,7 +73,8 @@ bool WledOutput::stateChanged(uint8_t index, const LightState& state) const {
           last.red != state.red ||
           last.green != state.green ||
           last.blue != state.blue ||
-          last.white != state.white);
+          last.white != state.white ||
+          strcmp(last.hueEffect, state.hueEffect) != 0);
 }
 
 bool WledOutput::sendToWled(const LightConfig& cfg, const LightState& state) {
@@ -74,10 +104,16 @@ bool WledOutput::sendToWled(const LightConfig& cfg, const LightState& state) {
                     : static_cast<uint8_t>(state.brightness + (state.brightness > 0 ? 1 : 0));
     doc["bri"] = wledBri;
 
-    // Build segment with solid effect and color
+    // Build segment with effect and color
+    uint8_t fxPalette = 0;
+    uint8_t fxMode = hueEffectToWledFx(state.hueEffect, fxPalette);
+
     JsonArray seg = doc["seg"].to<JsonArray>();
     JsonObject seg0 = seg.add<JsonObject>();
-    seg0["fx"] = 0;  // Solid effect
+    seg0["fx"] = fxMode;
+    if (fxPalette != 0) {
+      seg0["pal"] = fxPalette;
+    }
 
     JsonArray col = seg0["col"].to<JsonArray>();
     JsonArray color0 = col.add<JsonArray>();
@@ -139,6 +175,7 @@ void WledOutput::update(const LightConfig* lights, const LightState* states, uin
       lastSent[i].green = states[i].green;
       lastSent[i].blue = states[i].blue;
       lastSent[i].white = states[i].white;
+      strlcpy(lastSent[i].hueEffect, states[i].hueEffect, HUE_EFFECT_MAX_LEN);
 
       if (sendErrors[i] > 0) {
         ESP_LOGI("WLED", "Device %s recovered after %lu errors",
